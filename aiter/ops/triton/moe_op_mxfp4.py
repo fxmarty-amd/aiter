@@ -113,6 +113,8 @@ def _fused_moe_kernel_mxfp4(
     BLOCK_SIZE_M, which is necessary to maintain consistency in block matrix
     multiplication across different blocks processed by the same expert.
     """
+    is_a_scaled: tl.constexpr = a_scale_ptr is not None
+    is_b_scaled: tl.constexpr = b_scale_ptr is not None
     is_a_microscaled_format: tl.constexpr = a_mx_scale_ptr is not None
     is_b_microscaled_format: tl.constexpr = b_mx_scale_ptr is not None
     MX_PACK_DIVISOR: tl.constexpr = 32
@@ -187,8 +189,15 @@ def _fused_moe_kernel_mxfp4(
         return
 
     # Load a_scale, b_scale
-    a_scale = tl.load(a_scale_ptr)
-    b_scale = tl.load(b_scale_ptr + off_expert)
+    if is_a_scaled:
+        a_scale = tl.load(a_scale_ptr)
+    else:
+        a_scale = None
+    if is_b_scaled:
+        b_scale = tl.load(b_scale_ptr + off_expert)
+    else:
+        b_scale = None
+
     # Set offsets of B on dim N
     offs_b_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_b_n = tl.max_contiguous(
@@ -357,7 +366,11 @@ def _fused_moe_kernel_mxfp4(
         b_ptrs += PACKED_BLOCK_K_B * stride_bk
 
     # Multiply with the scalar weight
-    accumulator *= a_scale * b_scale
+    if is_a_scaled:
+        accumulator *= a_scale
+    if is_b_scaled:
+        accumulator *= b_scale
+    
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
@@ -379,7 +392,7 @@ def fused_moe_mxfp4(
     A_mx_scale: torch.Tensor,
     B_mx_scale: torch.Tensor,
     topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
+    num_valid_tokens: int,
     sorted_token_ids: torch.Tensor,
     expert_ids: torch.Tensor,
     num_tokens_post_padded: torch.Tensor,
@@ -396,8 +409,6 @@ def fused_moe_mxfp4(
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
 
-    assert A_scale is not None
-    assert B_scale is not None
     if A.dtype == torch.uint8:
         assert A_mx_scale is not None, "A_mx_scale should exist when A is mxfp4"
         A_mx_scale_strid_m, A_mx_scale_strid_k = A_mx_scale.stride()
@@ -434,7 +445,7 @@ def fused_moe_mxfp4(
         B.shape[1],
         A.shape[1],
         EM,
-        topk_ids.numel(),
+        num_valid_tokens,
         A.stride(0),
         A.stride(1),
         B.stride(0),
