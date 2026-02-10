@@ -103,6 +103,8 @@ def gemm_a4w4(
             f"A4W4 GEMM kernel is not supported on gfx942, but got {gfx_arch}!"
         )
     ck_config = get_GEMM_config(m, n, k)
+
+    # print("ck_config", ck_config)
     # splitK = None
     splitK = 0
     kernelName = ""

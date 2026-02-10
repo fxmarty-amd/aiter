@@ -76,7 +76,7 @@ def get_gemm_config(
         Dictionary with the config params
     """
     # Input validation
-    print("config_name", config_name)
+    # print("config_name", config_name)
     assert M >= 0, "M must be positive."
     assert N is None or N > 0, "N must be positive when provided."
     assert K is None or K > 0, "K must be positive when provided."
@@ -92,7 +92,7 @@ def get_gemm_config(
     dev = arch_info.get_arch()
     cache_key = f"{dev}_{config_name}"
 
-    print("cache_key", cache_key)
+    # print("cache_key", cache_key)
 
     if cache_key not in get_gemm_config._config_cache:
         get_gemm_config._config_cache[cache_key] = {}
@@ -137,7 +137,7 @@ def get_gemm_config(
 
     config_dict = get_gemm_config._config_cache[cache_key][config_dict_key]
 
-    print("config_dict", config_dict.keys(), config_dict)
+    # print("config_dict", config_dict.keys(), config_dict)
 
     # use standard bounds unless custom bounds are passed
     search_bounds = bounds if bounds is not None else STANDARD_M_BOUNDS
