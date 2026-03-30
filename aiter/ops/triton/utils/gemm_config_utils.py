@@ -107,6 +107,7 @@ def get_gemm_config(
     config_dict_key = "default"
 
     # Handle custom specialized filename (for fused kernels with multiple N dims)
+    # print("specialized_filename", specialized_filename)
     if specialized_filename is not None:
         spec_key = specialized_filename
         if spec_key not in get_gemm_config._config_cache[cache_key]:
@@ -120,8 +121,11 @@ def get_gemm_config(
 
     elif N is not None and K is not None:
         nk_key = f"{N}_{K}"
+        # print("get_gemm_config._config_cache", get_gemm_config._config_cache)
+        # print("nk_key", nk_key)
         if nk_key not in get_gemm_config._config_cache[cache_key]:
             # load specialized config
+            # print("fpath", fpath)
             fpath = (
                 f"{AITER_TRITON_CONFIGS_PATH}/gemm/{dev}-{config_name}-N={N}-K={K}.json"
             )
@@ -132,7 +136,12 @@ def get_gemm_config(
         else:
             config_dict_key = nk_key
 
+    print("config_dict_key", config_dict_key)
+    assert config_dict_key != "default"
+
     config_dict = get_gemm_config._config_cache[cache_key][config_dict_key]
+
+    print("config_dict", config_dict)
 
     # use standard bounds unless custom bounds are passed
     search_bounds = bounds if bounds is not None else STANDARD_M_BOUNDS

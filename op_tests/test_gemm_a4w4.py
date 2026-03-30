@@ -2,9 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import os
 
 import pandas as pd
 import torch
+
+import torch.nn.functional as F
 
 import aiter
 from aiter import dtypes
@@ -88,9 +91,18 @@ def run_gemm_asm(
 @benchmark()
 def test_gemm(dtype, M, N, K):
     from aiter.jit.utils.chip_info import get_gfx
+    from aiter.ops.gemm_op_a4w4 import get_GEMM_config
 
     if get_gfx() not in ["gfx950"]:
         return
+
+    # Verify a tuned config exists for this shape (not falling back to default)
+    ck_config = get_GEMM_config(M, N, K)
+    assert ck_config is not None, (
+        f"No tuned config found for M={M}, N={N}, K={K}. "
+        f"Make sure AITER_CONFIG_GEMM_A4W4 points to a CSV containing this shape."
+    )
+
     ret = {}
     quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
     x = torch.randn((M, K), dtype=dtype)
@@ -117,10 +129,17 @@ def test_gemm(dtype, M, N, K):
         bpreshuffle=True,
     )
     err = checkAllclose(a, c, msg="unified api")
-    ret["us"] = us
-    ret["TFLOPS"] = M * N * K * 2 / us / 1e6
-    ret["TB/s"] = (x.nbytes + w.nbytes) / us / 1e6
-    ret["err"] = err
+    ret["a4w4 us"] = us
+    ret["a4w4 TFLOPS"] = M * N * K * 2 / us / 1e6
+    ret["a4w4 err"] = err
+
+    # BF16 GEMM baseline
+    x_bf16 = torch.randn((M, K), dtype=dtype, device="cuda")
+    w_bf16 = torch.randn((N, K), dtype=dtype, device="cuda")
+    _, bf16_us = run_perftest(F.linear, x_bf16, w_bf16)
+    ret["bf16 us"] = bf16_us
+    ret["bf16 TFLOPS"] = M * N * K * 2 / bf16_us / 1e6
+    ret["speedup"] = bf16_us / us
 
     # kernelName = "" # "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E"
     # log2_k_split = 1
@@ -170,86 +189,23 @@ parser.add_argument(
     help="""Data type.
     e.g.: -d bf16""",
 )
+_default_csv = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "aiter", "configs", "a4w4_blockscale_untuned_gemm.csv",
+)
+_default_shapes = []
+if os.path.exists(_default_csv):
+    _df = pd.read_csv(_default_csv, skipinitialspace=True)
+    _default_shapes = [
+        (int(row["M"]), int(row["N"]), int(row["K"])) for _, row in _df.iterrows()
+    ]
+
 parser.add_argument(
     "-mnk",
     "--shape",
     type=dtypes.str2tuple,
     nargs="*",
-    default=[
-        # pure_compute
-        (256, 2048, 8192),
-        (2048, 8192, 8192),
-        (16384, 16384, 16384),
-        (32768, 106496, 16384),
-        (32768, 16384, 53248),
-        (32768, 18432, 16384),
-        (32768, 16384, 16384),
-        (128, 106496, 16384),
-        (128, 16384, 53248),
-        (128, 18432, 16384),
-        (128, 16384, 16384),
-        (64, 106496, 16384),
-        (64, 16384, 53248),
-        (64, 18432, 16384),
-        (64, 16384, 16384),
-        (64, 106496, 16384),
-        (32, 106496, 16384),
-        (32, 16384, 53248),
-        (32, 18432, 16384),
-        (32, 16384, 16384),
-        # qkv_proj
-        (1, 1280, 8192),
-        (64, 1280, 8192),
-        (127, 1280, 8192),
-        (129, 1280, 8192),
-        (65, 1280, 8192),
-        (32, 1280, 8192),
-        (64, 1280, 8192),
-        (128, 1280, 8192),
-        (192, 1280, 8192),
-        (256, 1280, 8192),
-        (320, 1280, 8192),
-        (512, 1280, 8192),
-        (1024, 1280, 8192),
-        (2048, 1280, 8192),
-        (4096, 1280, 8192),
-        (8192, 1280, 8192),
-        # attn_out
-        (1, 8192, 1024),
-        (32, 8192, 1024),
-        (64, 8192, 1024),
-        (128, 8192, 1024),
-        (192, 8192, 1024),
-        (256, 8192, 1024),
-        (320, 8192, 1024),
-        (512, 8192, 1024),
-        (1024, 8192, 1024),
-        (2048, 8192, 1024),
-        (4096, 8192, 1024),
-        (8192, 8192, 1024),
-        (16384, 8192, 1024),
-        # tune
-        (1552, 8192, 8192),
-        (1664, 8192, 8192),
-        (1792, 8192, 8192),
-        (1920, 8192, 8192),
-        (3072, 8192, 8192),
-        (1552, 10240, 8192),
-        (1664, 10240, 8192),
-        (1792, 10240, 8192),
-        (1920, 10240, 8192),
-        (3072, 10240, 8192),
-        (1552, 57344, 8192),
-        (1664, 57344, 8192),
-        (1792, 57344, 8192),
-        (1920, 57344, 8192),
-        (3072, 57344, 8192),
-        (1552, 8192, 28672),
-        (1664, 8192, 28672),
-        (1792, 8192, 28672),
-        (1920, 8192, 28672),
-        (3072, 8192, 28672),
-    ],
+    default=_default_shapes,
     help="""Shape of mnk.
     e.g. -mnk 1280,8192,1024""",
 )
