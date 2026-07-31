@@ -90,9 +90,18 @@ def streaming_topk(
             b = tl.load(Bias + offs_x_n, mask=bias_col_mask, other=0.0)
             x = x + b[None, :].to(x_dtype)
         x = tl.where(mask_m & mask_n, x, float("-inf"))
+    valid_logits = mask_m & mask_n
+    tl.device_assert(
+        ((x == x) & (x != float("inf")) & (x != -float("inf"))) | ~valid_logits,
+        "topk non-finite logits",
+    )
+    # valid = mask_m & mask_n
     x = fpval_to_key(x.to(x_utype, bitcast=True))
     x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
+    # x = tl.where(valid, x, 0)
     acc = tl.topk(x, N_EXPTS_ACT_PAD, dim=1)
+    acc_expert = (acc & 0xFFFF).to(tl.uint32)
+    # tl.device_assert(acc_expert < n_expts_tot, "topk peeled padded expert")
 
     # subsequent iterations: full blocks within n_expts_tot, no col mask
     for _i in (tl.static_range if loop_iterations <= 4 else range)(loop_iterations):
@@ -108,9 +117,18 @@ def streaming_topk(
                 b = tl.load(Bias + offs_x_n)
                 x = x + b[None, :].to(x_dtype)
             x = tl.where(mask_m, x, float("-inf"))
+        valid_logits = mask_m
+        tl.device_assert(
+            ((x == x) & (x != float("inf")) & (x != -float("inf"))) | ~valid_logits,
+            "topk non-finite logits",
+        )
+        # valid = mask_m
         x = fpval_to_key(x.to(x_utype, bitcast=True))
         x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
+        # x = tl.where(valid, x, 0)
         acc = tl.maximum(acc, tl.topk(x, N_EXPTS_ACT_PAD, dim=1))
+        acc_expert = (acc & 0xFFFF).to(tl.uint32)
+        # tl.device_assert(acc_expert < n_expts_tot, "topk merge padded expert")
 
     # Pre-existing bug fix: after the streaming merge loop, acc is not
     # guaranteed to be sorted by value (tl.maximum of an ASC and the new
@@ -133,6 +151,7 @@ def streaming_topk(
     acc = tl.sort(acc, dim=1)
     # iiii0000vvvvvvvv --> 0000iiii:
     y_indices = (acc >> (y_nbits - 16)).to(tl.uint32)
+    # tl.device_assert(y_indices < n_expts_tot, "topk final padded expert")
     # iiii0000vvvvvvvv --> vvvvvvvv:
     y_values_raw = acc.to(x_utype)
     y_values = key_to_fpval(y_values_raw).to(x_dtype, bitcast=True)
@@ -226,9 +245,14 @@ def _topk(
     # Post-selection ops (bias-subtract, renorm, scaling) must operate on
     # real entries only — otherwise -inf poisons the renorm sum, and the
     # sentinel y_indices (== N_EXPTS_PAD) would OOB the Bias array.
-    real_mask = (
-        y_indices != N_EXPTS_PAD if N_EXPTS_ACT != N_EXPTS_ACT_PAD else (y_indices >= 0)
+    active_topk_mask = (
+        offs_y_n[None, :] < N_EXPTS_ACT
+        if N_EXPTS_ACT != N_EXPTS_ACT_PAD
+        else tl.full([1, N_EXPTS_ACT_PAD], 1, tl.int1)
     )
+    output_mask = mask_m & active_topk_mask
+    real_mask = y_indices < n_expts_tot
+    # tl.device_assert(real_mask | ~output_mask, "topk kernel bad expert")
 
     # For SCORE_MODE="sqrtsoftplus" with HAS_BIAS, the y_values returned by
     # streaming_topk are biased scores (sqrt(softplus(x)) + bias) — used for

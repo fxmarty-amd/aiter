@@ -10,7 +10,7 @@ from aiter.ops.triton.moe.moe_routing.routing import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.topk import biased_grouped_topk_torch, grouped_topk_torch
-from aiter.ops.triton.moe.moe_routing.topk import grouped_topk
+from aiter.ops.triton.moe.moe_routing.topk import grouped_topk, topk
 
 
 def _routing_block_m(n_tokens, n_expts_act, n_expts_tot):
@@ -108,7 +108,169 @@ def init_data(n_tokens, n_expts_tot, dtype=torch.float16, device="cuda"):
     return logits
 
 
+GPT_OSS_TOPK_LOGITS_CASES = [
+    "random",
+    "neg_inf",
+    "pos_inf",
+    "nan",
+    "very_negative",
+    "ties",
+    "all_masked_rows",
+    "stale_allocation",
+]
+
+
+def init_gpt_oss_topk_logits(n_tokens, n_expts_tot, seed, case):
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(seed)
+
+    if case == "stale_allocation":
+        stale = torch.empty(
+            (n_tokens, n_expts_tot), dtype=dtype, device=device
+        )
+        stale.fill_(float("nan"))
+        del stale
+        return torch.empty(
+            (n_tokens, n_expts_tot), dtype=dtype, device=device
+        ).detach()
+
+    logits = init_data(n_tokens, n_expts_tot, device=device, dtype=dtype).detach()
+    if case == "random":
+        return logits
+    if case == "neg_inf":
+        logits[:, -1] = -float("inf")
+        return logits
+    if case == "pos_inf":
+        logits[:, 0] = float("inf")
+        return logits
+    if case == "nan":
+        logits[:, 0] = float("nan")
+        return logits
+    if case == "very_negative":
+        logits.fill_(-3.0e38)
+        logits[:, :4] = torch.arange(4, device=device, dtype=dtype)
+        return logits
+    if case == "ties":
+        logits.fill_(1.0)
+        return logits
+    if case == "all_masked_rows":
+        logits.fill_(-float("inf"))
+        return logits
+    raise AssertionError(f"unknown logits case: {case}")
+
+
 n_tokens = [4, 7, 8, 64, 255, 256, 371, 911, 1023, 1024, 4096, 8192]
+
+
+@pytest.mark.parametrize("n_tokens", [1, 2, 4, 8, 16, 17, 255, 400, 7067])
+@pytest.mark.parametrize("seed", [0, 1, 2, 17])
+@pytest.mark.parametrize("logits_case", GPT_OSS_TOPK_LOGITS_CASES)
+def test_topk_gpt_oss_shape_valid_expert_ids(n_tokens, seed, logits_case):
+    if get_arch() not in ["gfx950", "gfx1250"]:
+        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+
+    n_expts_tot = 32
+    n_expts_act = 4
+    hist_block_m = 32
+    sm_first = False
+
+    logits = init_gpt_oss_topk_logits(
+        n_tokens, n_expts_tot, seed, logits_case
+    )
+
+    expt_scal, expt_indx, bitmatrix = topk(
+        logits,
+        n_expts_act,
+        apply_softmax=not sm_first,
+        HIST_BLOCK_M=hist_block_m,
+    )
+    assert expt_scal.shape == (n_tokens, n_expts_act)
+    assert expt_indx.shape == (n_tokens, n_expts_act)
+    assert torch.all(expt_indx >= 0)
+    assert torch.all(expt_indx < n_expts_tot)
+    assert bitmatrix.shape[0] == n_tokens
+
+    routing_data, gather_idx, scatter_idx = routing(
+        logits,
+        n_expts_act,
+        sm_first=sm_first,
+    )
+    n_gates = n_tokens * n_expts_act
+    assert routing_data.gate_scal.shape == (n_gates,)
+    assert routing_data.expt_hist.shape == (n_expts_tot,)
+    assert torch.equal(routing_data.expt_hist.sum(), torch.tensor(n_gates, device="cuda"))
+    assert gather_idx.shape == (n_gates,)
+    assert scatter_idx.shape == (n_gates,)
+    assert torch.all(gather_idx.to(torch.int64) >= 0)
+    assert torch.all(gather_idx.to(torch.int64) < n_gates)
+    assert torch.all(scatter_idx.to(torch.int64) >= 0)
+    assert torch.all(scatter_idx.to(torch.int64) < n_gates)
+
+
+@pytest.mark.parametrize("n_tokens", [1, 8, 16, 17, 400])
+@pytest.mark.parametrize("seed", [0, 2, 17])
+@pytest.mark.parametrize("logits_case", GPT_OSS_TOPK_LOGITS_CASES)
+def test_topk_gpt_oss_shape_valid_expert_ids_cudagraph(
+    n_tokens, seed, logits_case
+):
+    if get_arch() not in ["gfx950", "gfx1250"]:
+        pytest.skip("MOE stack not fully implemented on non-CDNA4 arch yet.")
+
+    n_expts_tot = 32
+    n_expts_act = 4
+    hist_block_m = 32
+    sm_first = False
+
+    logits = init_gpt_oss_topk_logits(
+        n_tokens, n_expts_tot, seed, logits_case
+    )
+
+    # Warm up allocations and compilation before graph capture.
+    for _ in range(3):
+        topk(
+            logits,
+            n_expts_act,
+            apply_softmax=not sm_first,
+            HIST_BLOCK_M=hist_block_m,
+        )
+        routing(logits, n_expts_act, sm_first=sm_first)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        expt_scal, expt_indx, bitmatrix = topk(
+            logits,
+            n_expts_act,
+            apply_softmax=not sm_first,
+            HIST_BLOCK_M=hist_block_m,
+        )
+        routing_data, gather_idx, scatter_idx = routing(
+            logits,
+            n_expts_act,
+            sm_first=sm_first,
+        )
+
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert expt_scal.shape == (n_tokens, n_expts_act)
+    assert expt_indx.shape == (n_tokens, n_expts_act)
+    assert torch.all(expt_indx >= 0)
+    assert torch.all(expt_indx < n_expts_tot)
+    assert bitmatrix.shape[0] == n_tokens
+    n_gates = n_tokens * n_expts_act
+    assert routing_data.gate_scal.shape == (n_gates,)
+    assert routing_data.expt_hist.shape == (n_expts_tot,)
+    assert torch.equal(
+        routing_data.expt_hist.sum(), torch.tensor(n_gates, device="cuda")
+    )
+    assert gather_idx.shape == (n_gates,)
+    assert scatter_idx.shape == (n_gates,)
+    assert torch.all(gather_idx.to(torch.int64) >= 0)
+    assert torch.all(gather_idx.to(torch.int64) < n_gates)
+    assert torch.all(scatter_idx.to(torch.int64) >= 0)
+    assert torch.all(scatter_idx.to(torch.int64) < n_gates)
 
 
 @pytest.mark.parametrize("n_tokens", n_tokens)

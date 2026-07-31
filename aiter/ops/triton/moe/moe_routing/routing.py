@@ -1,6 +1,7 @@
 import os
 import torch
 import triton
+import triton.language as tl
 from dataclasses import dataclass, field
 from aiter.ops.triton._triton_kernels.moe.moe_routing.routing import (
     _combined_routing,
@@ -21,6 +22,36 @@ _USE_HERD = os.environ.get("AITER_TRITON_USE_HERD", "") not in (
 )
 _HERD_MIN_M = int(os.environ.get("AITER_TRITON_HERD_MIN_M", "16"))
 _HERD_MAX_M = int(os.environ.get("AITER_TRITON_HERD_MAX_M", "128"))
+
+
+@triton.jit
+def _assert_valid_expt_indx_kernel(
+    expt_indx,
+    n_elements,
+    n_expts_tot: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elements
+    vals = tl.load(expt_indx + offs, mask=mask, other=0)
+    tl.device_assert((vals >= 0) | ~mask, "topk bad expert low")
+    tl.device_assert((vals < n_expts_tot) | ~mask, "topk bad expert high")
+
+
+def _assert_valid_expt_indx(expt_indx, n_expts_tot):
+    n_elements = expt_indx.numel()
+    if n_elements == 0:
+        return
+    block = 1024
+    grid = (triton.cdiv(n_elements, block),)
+    _assert_valid_expt_indx_kernel[grid](
+        expt_indx,
+        n_elements,
+        n_expts_tot,
+        BLOCK=block,
+        num_warps=4,
+    )
 
 
 @dataclass
@@ -133,6 +164,7 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         block_pid_map.shape[0],  #
         block_m_log2,
         BLOCK_A=BLOCK_A,
+        # EQUAL_A=False,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
         USE_TDM=is_tdm_avail(),
         num_warps=1,
@@ -205,6 +237,7 @@ def sort_tokens_fused(
         block_pid_map.shape[0],  #
         block_m_log2,
         BLOCK_A=BLOCK_A,
+        # EQUAL_A=False,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
         USE_TDM=is_tdm_avail(),
         num_warps=1,
@@ -232,7 +265,8 @@ def log2_power_of_two(x):
 
 
 def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
-    BLOCK = triton.next_power_of_2(n_expts_tot)
+    # BLOCK = triton.next_power_of_2(n_expts_tot)
+    BLOCK = 128
     cdiv = triton.cdiv
     block_m_log2 = log2_power_of_two(block_m)
     if n_gates <= n_expts_tot:
@@ -319,17 +353,32 @@ def routing(
         HIST_BLOCK_M = 32
         if sm_first:
             logits = torch.softmax(logits, dim=-1)
+        print(
+            "AITER topk metadata "
+            f"logits.shape={tuple(logits.shape)} "
+            f"logits.dtype={logits.dtype} "
+            f"logits.stride={tuple(logits.stride())} "
+            f"logits.data_ptr={logits.data_ptr()} "
+            f"topk={n_expts_act} "
+            f"sm_first={sm_first} "
+            f"HIST_BLOCK_M={HIST_BLOCK_M}",
+            flush=True,
+        )
         expt_scal, expt_indx, bitmatrix = topk(
             logits,
             n_expts_act,
             apply_softmax=not sm_first,
             HIST_BLOCK_M=HIST_BLOCK_M,
         )
+        _assert_valid_expt_indx(expt_indx, n_expts_tot)
         if num_tokens <= 16:
             HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
             sort_fn = sort_tokens_fused
+            print("sort_fn", "sort_tokens_fused", flush=True)
         else:
             sort_fn = sort_tokens
+            print("sort_fn", "sort_tokens", flush=True)
+
         (
             hist,
             topk_indx,

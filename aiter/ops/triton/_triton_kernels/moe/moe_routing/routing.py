@@ -16,10 +16,14 @@ def _keyed_add(x, y):
 
     # we keep the key in the upper 16 bits of a uint32:
     key_mask: tl.constexpr = 0xFFFF0000
+    val_mask: tl.constexpr = 0x0000FFFF
 
     kx = x & key_mask
     ky = y & key_mask
-    z = tl.where(kx == ky, x + y - kx, y)
+    vx = x & val_mask
+    vy = y & val_mask
+    z_same_key = kx | (vx + vy)
+    z = tl.where(kx == ky, z_same_key, y)
     return z
 
 
@@ -40,6 +44,7 @@ def _routing_compute_indx(
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
     N_EXPTS_ACT_PAD: tl.constexpr,
+    N_EXPTS_TOT: tl.constexpr,
     USE_TDM: tl.constexpr,
 ):
 
@@ -53,6 +58,7 @@ def _routing_compute_indx(
     # tiles (e.g. decode bs=1, where BLOCK_M=1 -> LOAD_SIZE=N_EXPTS_ACT_PAD) fall
     # back to the functionally-identical plain-load branch below.
     if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD and LOAD_SIZE >= 8:
+        tl.device_assert(offs < n_gates, "bad tdm expert load")
         expt_desc = tl.make_tensor_descriptor(
             base=ExptIndx + pid_m * BLOCK_M * N_EXPTS_ACT,
             shape=(1, LOAD_SIZE),
@@ -62,47 +68,74 @@ def _routing_compute_indx(
         expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
         expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
     elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
-        expert = tl.load(ExptIndx + offs).to(tl.uint32)
+        expert = tl.load(ExptIndx + offs, mask=offs < n_gates, other=-1).to(tl.uint32)
     else:
         expert = tl.load(ExptIndx + offs, mask=(offs < n_gates), other=-1).to(tl.uint32)
+    # expert = tl.where((expert < N_EXPTS_TOT) & (offs < n_gates), expert, -1).to(
+    #     tl.uint32
+    # )
 
     # stable-sort by expert ID:
     kv_pairs = ((expert << 16) | local_offs).to(tl.uint32)
     kv_pairs = tl.sort(kv_pairs, 0)
     expert = kv_pairs >> 16
     offs = pid_m * BLOCK_M * N_EXPTS_ACT + (kv_pairs & 0xFFFF)
+    tl.device_assert((expert < N_EXPTS_TOT) | (expert == 0xFFFF), "bad sorted expert")
 
     if EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
-        gate_scal = tl.load(ExptScal + offs)
+        mask = (expert < N_EXPTS_TOT) & (offs < n_gates)
+        safe_expert = tl.where(mask, expert, 0)
+        safe_offs = tl.where(mask, offs, 0)
+        tl.device_assert(safe_expert < N_EXPTS_TOT, "bad safe expert")
+        tl.device_assert(safe_offs < n_gates, "bad safe offs")
+        gate_scal = tl.load(ExptScal + safe_offs, mask=mask, other=0.0)
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
         expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
-        gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn)
-        gates += tl.load(TokensStart + expert)
+        gates = tl.load(
+            PartialOffs + pid_m * stride_pm + safe_expert * stride_pn,
+            mask=mask,
+            other=0,
+        )
+        gates += tl.load(TokensStart + safe_expert, mask=mask, other=0)
         gates += exclusive_run_lengths
 
-        tl.store(ScatterIndx + offs, gates)
-        tl.store(GatherIndx + gates, offs)
-        tl.store(GateScal + gates, gate_scal)
+        tl.device_assert((gates < n_gates) | ~mask, "bad gates")
+        safe_gates = tl.where(mask, gates, 0)
+        tl.device_assert(safe_gates < n_gates, "bad safe gates")
+        tl.store(ScatterIndx + safe_offs, gates, mask=mask)
+        tl.store(GatherIndx + safe_gates, safe_offs, mask=mask)
+        tl.store(GateScal + safe_gates, gate_scal, mask=mask)
     else:
-        mask = expert != 0xFFFF
-        gate_scal = tl.load(ExptScal + offs, mask=mask)
+        mask = (expert < N_EXPTS_TOT) & (offs < n_gates)
+        safe_expert = tl.where(mask, expert, 0)
+        safe_offs = tl.where(mask, offs, 0)
+        tl.device_assert(safe_expert < N_EXPTS_TOT, "bad safe expert")
+        tl.device_assert(safe_offs < n_gates, "bad safe offs")
+        gate_scal = tl.load(ExptScal + safe_offs, mask=mask, other=0.0)
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
         expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
-        gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn, mask=mask)
-        gates += tl.load(TokensStart + expert, mask=mask)
+        gates = tl.load(
+            PartialOffs + pid_m * stride_pm + safe_expert * stride_pn,
+            mask=mask,
+            other=0,
+        )
+        gates += tl.load(TokensStart + safe_expert, mask=mask, other=0)
         gates += exclusive_run_lengths
 
-        tl.store(ScatterIndx + offs, gates, mask=mask)
-        tl.store(GatherIndx + gates, offs, mask=mask)
-        tl.store(GateScal + gates, gate_scal, mask=mask)
+        tl.device_assert((gates < n_gates) | ~mask, "bad gates")
+        safe_gates = tl.where(mask, gates, 0)
+        tl.device_assert(safe_gates < n_gates, "bad safe gates")
+        tl.store(ScatterIndx + safe_offs, gates, mask=mask)
+        tl.store(GatherIndx + safe_gates, safe_offs, mask=mask)
+        tl.store(GateScal + safe_gates, gate_scal, mask=mask)
 
 
 @triton.jit
@@ -118,6 +151,7 @@ def _routing_compute_indx_fused(
     EVEN_M: tl.constexpr,
     N_EXPTS_ACT: tl.constexpr,
     N_EXPTS_ACT_PAD: tl.constexpr,
+    N_EXPTS_TOT: tl.constexpr,
     USE_TDM: tl.constexpr,
 ):
 
@@ -131,6 +165,7 @@ def _routing_compute_indx_fused(
     # tiles (e.g. decode bs=1, where BLOCK_M=1 -> LOAD_SIZE=N_EXPTS_ACT_PAD) fall
     # back to the functionally-identical plain-load branch below.
     if USE_TDM and EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD and LOAD_SIZE >= 8:
+        tl.device_assert(offs < n_gates, "bad fused tdm expert load")
         expt_desc = tl.make_tensor_descriptor(
             base=ExptIndx,
             shape=(1, LOAD_SIZE),
@@ -140,45 +175,66 @@ def _routing_compute_indx_fused(
         expert = tl.reshape(expt_desc.load([0, 0]), (LOAD_SIZE,))
         expert = tl.where(offs < n_gates, expert, -1).to(tl.uint32)
     elif EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
-        expert = tl.load(ExptIndx + offs).to(tl.uint32)
+        expert = tl.load(ExptIndx + offs, mask=offs < n_gates, other=-1).to(tl.uint32)
     else:
         expert = tl.load(ExptIndx + offs, mask=(offs < n_gates), other=-1).to(tl.uint32)
+    # expert = tl.where((expert < N_EXPTS_TOT) & (offs < n_gates), expert, -1).to(
+    #     tl.uint32
+    # )
 
     # stable-sort by expert ID:
     kv_pairs = ((expert << 16) | local_offs).to(tl.uint32)
     kv_pairs = tl.sort(kv_pairs, 0)
     expert = kv_pairs >> 16
     offs = kv_pairs & 0xFFFF
+    tl.device_assert(
+        (expert < N_EXPTS_TOT) | (expert == 0xFFFF), "bad fused sorted expert"
+    )
 
     if EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
-        gate_scal = tl.load(ExptScal + offs)
+        mask = (expert < N_EXPTS_TOT) & (offs < n_gates)
+        safe_expert = tl.where(mask, expert, 0)
+        safe_offs = tl.where(mask, offs, 0)
+        tl.device_assert(safe_expert < N_EXPTS_TOT, "bad fused safe expert")
+        tl.device_assert(safe_offs < n_gates, "bad fused safe offs")
+        gate_scal = tl.load(ExptScal + safe_offs, mask=mask, other=0.0)
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
         expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
-        gates = tl.load(TokensStart + expert)
+        gates = tl.load(TokensStart + safe_expert, mask=mask, other=0)
         gates += exclusive_run_lengths
 
-        tl.store(ScatterIndx + offs, gates)
-        tl.store(GatherIndx + gates, offs)
-        tl.store(GateScal + gates, gate_scal)
+        tl.device_assert((gates < n_gates) | ~mask, "bad fused gates")
+        safe_gates = tl.where(mask, gates, 0)
+        tl.device_assert(safe_gates < n_gates, "bad fused safe gates")
+        tl.store(ScatterIndx + safe_offs, gates, mask=mask)
+        tl.store(GatherIndx + safe_gates, safe_offs, mask=mask)
+        tl.store(GateScal + safe_gates, gate_scal, mask=mask)
     else:
-        mask = expert != 0xFFFF
-        gate_scal = tl.load(ExptScal + offs, mask=mask)
+        mask = (expert < N_EXPTS_TOT) & (offs < n_gates)
+        safe_expert = tl.where(mask, expert, 0)
+        safe_offs = tl.where(mask, offs, 0)
+        tl.device_assert(safe_expert < N_EXPTS_TOT, "bad fused safe expert")
+        tl.device_assert(safe_offs < n_gates, "bad fused safe offs")
+        gate_scal = tl.load(ExptScal + safe_offs, mask=mask, other=0.0)
 
         # compute run lengths in expert-sorted order:
         x = kv_pairs & 0xFFFF0000 | 0x00000001
         expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
-        gates = tl.load(TokensStart + expert, mask=mask)
+        gates = tl.load(TokensStart + safe_expert, mask=mask, other=0)
         gates += exclusive_run_lengths
 
-        tl.store(ScatterIndx + offs, gates, mask=mask)
-        tl.store(GatherIndx + gates, offs, mask=mask)
-        tl.store(GateScal + gates, gate_scal, mask=mask)
+        tl.device_assert((gates < n_gates) | ~mask, "bad fused gates")
+        safe_gates = tl.where(mask, gates, 0)
+        tl.device_assert(safe_gates < n_gates, "bad fused safe gates")
+        tl.store(ScatterIndx + safe_offs, gates, mask=mask)
+        tl.store(GatherIndx + safe_gates, safe_offs, mask=mask)
+        tl.store(GateScal + safe_gates, gate_scal, mask=mask)
 
 
 @triton.jit
@@ -209,6 +265,13 @@ def _combined_routing(
     USE_TDM: tl.constexpr,
 ):
 
+    # tl.static_assert(BLOCK_A >= n_expts_tot)
+    # tl.static_assert((BLOCK_A & (BLOCK_A - 1)) == 0)
+    # tl.static_assert((BLOCK_M & (BLOCK_M - 1)) == 0)
+    # tl.static_assert((N_EXPTS_ACT_PAD & (N_EXPTS_ACT_PAD - 1)) == 0)
+    # tl.static_assert(N_EXPTS_ACT <= N_EXPTS_ACT_PAD)
+    # tl.static_assert(N_EXPTS_ACT_PAD * BLOCK_M <= 32768)
+
     pid = tl.program_id(0)
 
     _expt_data_compute_stage1(
@@ -219,6 +282,9 @@ def _combined_routing(
         TileStart,
         MDTileInfo,
         max_num_tiles,
+        n_expts_tot + 1,
+        n_expts_tot + 1,
+        max_num_tiles,
         n_gates,
         tile_dim_log2,
         BLOCK_A,
@@ -226,7 +292,9 @@ def _combined_routing(
     )
 
     if pid < blocks1a:
-        _expt_data_compute_stage2(pid, ExpertHist, TileStart, MDTileInfo, tile_dim_log2)
+        _expt_data_compute_stage2(
+            pid, ExpertHist, TileStart, MDTileInfo, max_num_tiles, tile_dim_log2
+        )
     else:
         pid -= blocks1a
         _routing_compute_indx(
@@ -245,6 +313,7 @@ def _combined_routing(
             EVEN_M,
             N_EXPTS_ACT,
             N_EXPTS_ACT_PAD,
+            n_expts_tot,
             USE_TDM,
         )
 
@@ -307,6 +376,9 @@ def _combined_routing_fused(
         TileStart,
         MDTileInfo,
         max_num_tiles,
+        N_EXPTS_TOT + 1,
+        N_EXPTS_TOT + 1,
+        max_num_tiles,
         n_gates,
         tile_dim_log2,
         BLOCK_A,
@@ -328,5 +400,6 @@ def _combined_routing_fused(
             EVEN_M,
             N_EXPTS_ACT,
             N_EXPTS_ACT_PAD,
+            N_EXPTS_TOT,
             USE_TDM,
         )
