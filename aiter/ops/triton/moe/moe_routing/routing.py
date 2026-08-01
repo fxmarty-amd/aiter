@@ -164,7 +164,6 @@ def sort_tokens(expt_scal, expt_indx, n_expts_tot, bitmatrix, block_m, HIST_BLOC
         block_pid_map.shape[0],  #
         block_m_log2,
         BLOCK_A=BLOCK_A,
-        # EQUAL_A=False,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
         USE_TDM=is_tdm_avail(),
         num_warps=1,
@@ -237,7 +236,6 @@ def sort_tokens_fused(
         block_pid_map.shape[0],  #
         block_m_log2,
         BLOCK_A=BLOCK_A,
-        # EQUAL_A=False,
         EQUAL_A=(hist.shape[0] == BLOCK_A),  # optimization parameters
         USE_TDM=is_tdm_avail(),
         num_warps=1,
@@ -265,8 +263,8 @@ def log2_power_of_two(x):
 
 
 def _compute_expt_data_internal(n_expts_tot, n_gates, block_m, device):
-    # BLOCK = triton.next_power_of_2(n_expts_tot)
-    BLOCK = 128
+    BLOCK = triton.next_power_of_2(n_expts_tot)
+    # BLOCK = 128
     cdiv = triton.cdiv
     block_m_log2 = log2_power_of_two(block_m)
     if n_gates <= n_expts_tot:

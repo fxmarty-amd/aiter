@@ -264,14 +264,6 @@ def _combined_routing(
     EQUAL_A: tl.constexpr,
     USE_TDM: tl.constexpr,
 ):
-
-    # tl.static_assert(BLOCK_A >= n_expts_tot)
-    # tl.static_assert((BLOCK_A & (BLOCK_A - 1)) == 0)
-    # tl.static_assert((BLOCK_M & (BLOCK_M - 1)) == 0)
-    # tl.static_assert((N_EXPTS_ACT_PAD & (N_EXPTS_ACT_PAD - 1)) == 0)
-    # tl.static_assert(N_EXPTS_ACT <= N_EXPTS_ACT_PAD)
-    # tl.static_assert(N_EXPTS_ACT_PAD * BLOCK_M <= 32768)
-
     pid = tl.program_id(0)
 
     _expt_data_compute_stage1(
