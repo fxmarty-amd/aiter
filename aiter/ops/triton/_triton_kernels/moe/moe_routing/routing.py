@@ -178,6 +178,11 @@ def _routing_compute_indx_fused(
         expert = tl.load(ExptIndx + offs).to(tl.uint32)
     else:
         expert = tl.load(ExptIndx + offs, mask=(offs < n_gates), other=-1).to(tl.uint32)
+    # IN KERNEL SANITIZE expert = tl.where(
+    # IN KERNEL SANITIZE     (offs < n_gates) & (expert < N_EXPTS_TOT),
+    # IN KERNEL SANITIZE     expert,
+    # IN KERNEL SANITIZE     0xFFFF,
+    # IN KERNEL SANITIZE )
 
     # stable-sort by expert ID:
     kv_pairs = ((expert << 16) | local_offs).to(tl.uint32)
@@ -189,12 +194,14 @@ def _routing_compute_indx_fused(
     # )
 
     if EVEN_M and N_EXPTS_ACT == N_EXPTS_ACT_PAD:
-        # mask = (expert < N_EXPTS_TOT) & (offs < n_gates)
-        # safe_expert = tl.where(mask, expert, 0)
-        # safe_offs = tl.where(mask, offs, 0)
+        # IN KERNEL SANITIZE mask = (expert < N_EXPTS_TOT) & (offs < n_gates)
+        # IN KERNEL SANITIZE safe_expert = tl.where(mask, expert, 0)
+        # IN KERNEL SANITIZE safe_offs = tl.where(mask, offs, 0)
         # tl.device_assert(expert < N_EXPTS_TOT, "bad fused safe expert")
         # tl.device_assert(offs < n_gates, "bad fused safe offs")
-        # gate_scal = tl.load(ExptScal + safe_offs, mask=mask, other=0.0)
+        # IN KERNEL SANITIZE gate_scal = tl.load(
+        # IN KERNEL SANITIZE     ExptScal + safe_offs, mask=mask, other=0.0
+        # IN KERNEL SANITIZE )
         gate_scal = tl.load(ExptScal + offs)
 
         # compute run lengths in expert-sorted order:
@@ -202,25 +209,32 @@ def _routing_compute_indx_fused(
         expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
-        # gates = tl.load(TokensStart + safe_expert, mask=mask, other=0)
+        # IN KERNEL SANITIZE gates = tl.load(
+        # IN KERNEL SANITIZE     TokensStart + safe_expert, mask=mask, other=0
+        # IN KERNEL SANITIZE )
         gates = tl.load(TokensStart + expert)
         gates += exclusive_run_lengths
 
         # tl.device_assert(gates < n_gates, "bad fused gates")
         # safe_gates = tl.where(mask, gates, 0)
         # tl.device_assert(safe_gates < n_gates, "bad fused safe gates")
-        # tl.store(ScatterIndx + safe_offs, gates, mask=mask)
-        # tl.store(GatherIndx + safe_gates, safe_offs, mask=mask)
-        # tl.store(GateScal + safe_gates, gate_scal, mask=mask)
+        # IN KERNEL SANITIZE safe_gates = tl.where(mask, gates, 0)
+        # IN KERNEL SANITIZE tl.store(ScatterIndx + safe_offs, gates, mask=mask)
+        # IN KERNEL SANITIZE tl.store(GatherIndx + safe_gates, safe_offs, mask=mask)
+        # IN KERNEL SANITIZE tl.store(GateScal + safe_gates, gate_scal, mask=mask)
         tl.store(ScatterIndx + offs, gates)
         tl.store(GatherIndx + gates, offs)
         tl.store(GateScal + gates, gate_scal)
     else:
         mask = expert != 0xFFFF
-        # safe_expert = tl.where(mask, expert, 0)
-        # safe_offs = tl.where(mask, offs, 0)
+        # IN KERNEL SANITIZE mask = (expert < N_EXPTS_TOT) & (offs < n_gates)
+        # IN KERNEL SANITIZE safe_expert = tl.where(mask, expert, 0)
+        # IN KERNEL SANITIZE safe_offs = tl.where(mask, offs, 0)
         # tl.device_assert((expert < N_EXPTS_TOT) | ~mask, "bad fused safe expert")
         # tl.device_assert((offs < n_gates) | ~mask, "bad fused safe offs")
+        # IN KERNEL SANITIZE gate_scal = tl.load(
+        # IN KERNEL SANITIZE     ExptScal + safe_offs, mask=mask, other=0.0
+        # IN KERNEL SANITIZE )
         gate_scal = tl.load(ExptScal + offs, mask=mask)
 
         # compute run lengths in expert-sorted order:
@@ -228,10 +242,17 @@ def _routing_compute_indx_fused(
         expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
         exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
 
+        # IN KERNEL SANITIZE gates = tl.load(
+        # IN KERNEL SANITIZE     TokensStart + safe_expert, mask=mask, other=0
+        # IN KERNEL SANITIZE )
         gates = tl.load(TokensStart + expert, mask=mask)
         gates += exclusive_run_lengths
 
         # tl.device_assert((gates < n_gates) | ~mask, "bad fused gates")
+        # IN KERNEL SANITIZE safe_gates = tl.where(mask, gates, 0)
+        # IN KERNEL SANITIZE tl.store(ScatterIndx + safe_offs, gates, mask=mask)
+        # IN KERNEL SANITIZE tl.store(GatherIndx + safe_gates, safe_offs, mask=mask)
+        # IN KERNEL SANITIZE tl.store(GateScal + safe_gates, gate_scal, mask=mask)
         tl.store(ScatterIndx + offs, gates, mask=mask)
         tl.store(GatherIndx + gates, offs, mask=mask)
         tl.store(GateScal + gates, gate_scal, mask=mask)

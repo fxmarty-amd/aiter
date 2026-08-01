@@ -98,7 +98,13 @@ def streaming_topk(
     # valid = mask_m & mask_n
     x = fpval_to_key(x.to(x_utype, bitcast=True))
     x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
-    # x = tl.where(valid, x, 0)
+    # The `other=-inf` placeholder above is NOT strictly below every real logit:
+    # -inf ties with a real -inf and sorts above a negative NaN, and ties are
+    # broken by the packed column index, which is largest for the padded
+    # columns. Such a row then selects `offs_x_n >= n_expts_tot`, i.e. an expert
+    # id that does not exist. Zero the whole packed key instead, which is the
+    # true minimum.
+    # x = tl.where(mask_n, x, 0)
     acc = tl.topk(x, N_EXPTS_ACT_PAD, dim=1)
     acc_expert = (acc & 0xFFFF).to(tl.uint32)
     # tl.device_assert(acc_expert < n_expts_tot, "topk peeled padded expert")
@@ -151,6 +157,7 @@ def streaming_topk(
     acc = tl.sort(acc, dim=1)
     # iiii0000vvvvvvvv --> 0000iiii:
     y_indices = (acc >> (y_nbits - 16)).to(tl.uint32)
+
     # tl.device_assert(y_indices < n_expts_tot, "topk final padded expert")
     # iiii0000vvvvvvvv --> vvvvvvvv:
     y_values_raw = acc.to(x_utype)
@@ -251,9 +258,28 @@ def _topk(
     #     else tl.full([1, N_EXPTS_ACT_PAD], 1, tl.int1)
     # )
     # output_mask = mask_m & active_topk_mask
+
     real_mask = (
         y_indices != N_EXPTS_PAD if N_EXPTS_ACT != N_EXPTS_ACT_PAD else (y_indices >= 0)
     )
+    # ALTERNATIVE FIX (superseded by the packed-key masking in streaming_topk).
+    # Clamping y_indices here does stop the memory fault, but it makes a row
+    # select the same expert several times. The histogram is built by OR-ing a
+    # per-token expert bitmask, so duplicates are counted once, while the
+    # counting sort in _routing_compute_indx emits one gate per slot -- the
+    # expert segment then overflows into the next one and clobbers gates that
+    # belong to other tokens. Zeroing y_values on top of that only replaces the
+    # NaN/inf that leaks into those tokens with a silently wrong 0.
+    #
+    # valid_values = (
+    #     (y_values == y_values)
+    #     & (y_values != float("inf"))
+    #     & (y_values != float("-inf"))
+    # )
+    # valid_entries = real_mask & (y_indices < n_expts_tot) & valid_values
+    # y_indices = tl.where(valid_entries, y_indices, 0)
+    # y_values = tl.where(valid_entries, y_values, 0.0)
+    # real_mask = valid_entries
     # tl.device_assert(real_mask | ~output_mask, "topk kernel bad expert")
 
     # For SCORE_MODE="sqrtsoftplus" with HAS_BIAS, the y_values returned by

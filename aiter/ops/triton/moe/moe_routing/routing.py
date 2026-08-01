@@ -377,6 +377,11 @@ def routing(
             sort_fn = sort_tokens
             print("sort_fn", "sort_tokens", flush=True)
 
+
+        # valid = (expt_indx >= 0) & (expt_indx < n_expts_tot) & torch.isfinite(expt_scal)
+        # expt_indx = torch.where(valid, expt_indx, 0)
+        # expt_scal = torch.where(valid, expt_scal, 0)
+
         (
             hist,
             topk_indx,
