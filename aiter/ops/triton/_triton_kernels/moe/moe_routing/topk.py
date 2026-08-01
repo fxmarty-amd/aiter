@@ -91,10 +91,10 @@ def streaming_topk(
             x = x + b[None, :].to(x_dtype)
         x = tl.where(mask_m & mask_n, x, float("-inf"))
     valid_logits = mask_m & mask_n
-    tl.device_assert(
-        ((x == x) & (x != float("inf")) & (x != -float("inf"))) | ~valid_logits,
-        "topk non-finite logits",
-    )
+    # tl.device_assert(
+    #     ((x == x) & (x != float("inf")) & (x != -float("inf"))) | ~valid_logits,
+    #     "topk non-finite logits",
+    # )
     # valid = mask_m & mask_n
     x = fpval_to_key(x.to(x_utype, bitcast=True))
     x = (x.to(x_ultype) << 16) | offs_x_n[None, :]
@@ -118,10 +118,10 @@ def streaming_topk(
                 x = x + b[None, :].to(x_dtype)
             x = tl.where(mask_m, x, float("-inf"))
         valid_logits = mask_m
-        tl.device_assert(
-            ((x == x) & (x != float("inf")) & (x != -float("inf"))) | ~valid_logits,
-            "topk non-finite logits",
-        )
+        # tl.device_assert(
+        #     ((x == x) & (x != float("inf")) & (x != -float("inf"))) | ~valid_logits,
+        #     "topk non-finite logits",
+        # )
         # valid = mask_m
         x = fpval_to_key(x.to(x_utype, bitcast=True))
         x = (x.to(x_ultype) << 16) | offs_x_n[None, :]

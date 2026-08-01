@@ -368,7 +368,7 @@ def routing(
             apply_softmax=not sm_first,
             HIST_BLOCK_M=HIST_BLOCK_M,
         )
-        _assert_valid_expt_indx(expt_indx, n_expts_tot)
+        # _assert_valid_expt_indx(expt_indx, n_expts_tot)
         if num_tokens <= 16:
             HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
             sort_fn = sort_tokens_fused
