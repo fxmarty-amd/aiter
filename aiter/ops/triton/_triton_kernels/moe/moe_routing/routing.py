@@ -16,15 +16,15 @@ def _keyed_add(x, y):
 
     # we keep the key in the upper 16 bits of a uint32:
     key_mask: tl.constexpr = 0xFFFF0000
-    # val_mask: tl.constexpr = 0x0000FFFF
+    val_mask: tl.constexpr = 0x0000FFFF
 
     kx = x & key_mask
     ky = y & key_mask
-    # vx = x & val_mask
-    # vy = y & val_mask
-    # z_same_key = kx | (vx + vy)
-    # z = tl.where(kx == ky, z_same_key, y)
-    z = tl.where(kx == ky, x + y - kx, y)
+    vx = x & val_mask
+    vy = y & val_mask
+    z_same_key = kx | (vx + vy)
+    z = tl.where(kx == ky, z_same_key, y)
+    # z = tl.where(kx == ky, x + y - kx, y)
     return z
 
 
