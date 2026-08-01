@@ -245,13 +245,15 @@ def _topk(
     # Post-selection ops (bias-subtract, renorm, scaling) must operate on
     # real entries only — otherwise -inf poisons the renorm sum, and the
     # sentinel y_indices (== N_EXPTS_PAD) would OOB the Bias array.
-    active_topk_mask = (
-        offs_y_n[None, :] < N_EXPTS_ACT
-        if N_EXPTS_ACT != N_EXPTS_ACT_PAD
-        else tl.full([1, N_EXPTS_ACT_PAD], 1, tl.int1)
+    # active_topk_mask = (
+    #     offs_y_n[None, :] < N_EXPTS_ACT
+    #     if N_EXPTS_ACT != N_EXPTS_ACT_PAD
+    #     else tl.full([1, N_EXPTS_ACT_PAD], 1, tl.int1)
+    # )
+    # output_mask = mask_m & active_topk_mask
+    real_mask = (
+        y_indices != N_EXPTS_PAD if N_EXPTS_ACT != N_EXPTS_ACT_PAD else (y_indices >= 0)
     )
-    output_mask = mask_m & active_topk_mask
-    real_mask = y_indices < n_expts_tot
     # tl.device_assert(real_mask | ~output_mask, "topk kernel bad expert")
 
     # For SCORE_MODE="sqrtsoftplus" with HAS_BIAS, the y_values returned by
