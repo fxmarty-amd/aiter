@@ -179,17 +179,24 @@ def _batched_gemm_a16wfp4_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            b_scales = tl.load(b_scale_ptrs)
             # a_scales = tl.full((BLOCK_SIZE_M, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # b_scales = tl.full((BLOCK_SIZE_N, BLOCK_SIZE_K//SCALE_GROUP_SIZE), 127, dtype=tl.uint8)
             # Load the next block of A and B, generate a mask by checking the K dimension.
             # If it is out of bounds, set it to 0.
             if EVEN_K:
+                b_scales = tl.load(b_scale_ptrs)
                 a_bf16 = tl.load(a_ptrs)
                 b = tl.load(b_ptrs, cache_modifier=cache_modifier)
             else:
+                remaining_k = 2 * K - k * BLOCK_SIZE_K
+                scale_mask = tl.arange(
+                    0, BLOCK_SIZE_K // SCALE_GROUP_SIZE
+                ) < tl.cdiv(remaining_k, SCALE_GROUP_SIZE)
+                b_scales = tl.load(
+                    b_scale_ptrs, mask=scale_mask[None, :], other=127
+                )
                 a_bf16 = tl.load(
-                    a_ptrs, mask=offs_k_bf16[None, :] < K - k * BLOCK_SIZE_K, other=0
+                    a_ptrs, mask=offs_k_bf16[None, :] < remaining_k, other=0
                 )
                 b = tl.load(
                     b_ptrs, mask=offs_k[:, None] < K - k * (BLOCK_SIZE_K // 2), other=0
