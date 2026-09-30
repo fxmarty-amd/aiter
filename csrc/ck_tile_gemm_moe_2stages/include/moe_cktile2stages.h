@@ -53,23 +53,17 @@ template <typename ADataType,
           int split_k>
 struct moe_gemm1_heuristic_dispatcher
 {
-    static MoeKernel dispatch(int M, int N, int K, int block_m)
+    static MoeKernel dispatch(int, int, int, int)
     {
         TORCH_CHECK(false,
                     "No CK-Tile MoE GEMM1 specialization: activation=",
                     activation,
                     ", has_bias=",
                     kHasBias,
-                    ", split_k=",
+                    ", split_k_gt_1=",
                     split_k,
-                    ", M=",
-                    M,
-                    ", N=",
-                    N,
-                    ", K=",
-                    K,
-                    ", block_m=",
-                    block_m);
+                    ". Consider adding the specialization in "
+                    "csrc/ck_tile_gemm_moe_2stages/gen_instances.py");
         return {};
     }
 };
@@ -83,23 +77,17 @@ template <typename ADataType,
           int split_k>
 struct moe_gemm2_heuristic_dispatcher
 {
-    static MoeKernel dispatch(int M, int N, int K, int block_m)
+    static MoeKernel dispatch(int, int, int, int)
     {
         TORCH_CHECK(false,
                     "No CK-Tile MoE GEMM2 specialization: activation=",
                     activation,
                     ", has_bias=",
                     kHasBias,
-                    ", split_k=",
+                    ", split_k_gt_1=",
                     split_k,
-                    ", M=",
-                    M,
-                    ", N=",
-                    N,
-                    ", K=",
-                    K,
-                    ", block_m=",
-                    block_m);
+                    ". Consider adding the specialization in "
+                    "csrc/ck_tile_gemm_moe_2stages/gen_instances.py");
         return {};
     }
 };

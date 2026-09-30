@@ -249,9 +249,7 @@ MoeKernel moe_dispatch(int M, int N, int K, int block_m, int activation, bool ha
                 ", has_bias=",
                 has_bias,
                 ", split_k=",
-                split_k,
-                ", block_m=",
-                block_m);
+                split_k);
     return {};
 }
 
