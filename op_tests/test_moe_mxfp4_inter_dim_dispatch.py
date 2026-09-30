@@ -292,13 +292,16 @@ def test_mxfp4_bf16_swiglu_interleaved_matches_separated(monkeypatch):
     monkeypatch.setenv("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "2147483647")
     get_2stage_cfgs.cache_clear()
     model_dim, inter_dim = 1024, 256
-    assert _stage_backend(
-        _dispatch(
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            gate_mode=GateMode.INTERLEAVE,
-        ).stage1
-    ) == "cktile"
+    assert (
+        _stage_backend(
+            _dispatch(
+                model_dim=model_dim,
+                inter_dim=inter_dim,
+                gate_mode=GateMode.INTERLEAVE,
+            ).stage1
+        )
+        == "cktile"
+    )
 
     torch.manual_seed(0)
     x = torch.randn((TOKEN, model_dim), dtype=torch.bfloat16, device="cuda")
@@ -333,12 +336,8 @@ def test_mxfp4_bf16_swiglu_interleaved_matches_separated(monkeypatch):
         interleave = gate_mode == GateMode.INTERLEAVE
         return fused_moe(
             x,
-            shuffle_weight(
-                w13_q, is_guinterleave=interleave, gate_up=True
-            ),
-            shuffle_weight(
-                w2_q, is_guinterleave=interleave, gate_up=False
-            ),
+            shuffle_weight(w13_q, is_guinterleave=interleave, gate_up=True),
+            shuffle_weight(w2_q, is_guinterleave=interleave, gate_up=False),
             topk_weights,
             topk_ids,
             activation=ActivationType.Swiglu,
