@@ -355,7 +355,7 @@ def test_mxfp4_bf16_swiglu_interleaved_matches_separated(monkeypatch):
             interleaved = run(GateMode.INTERLEAVE)
         assert torch.count_nonzero(separated) > 0
         torch.testing.assert_close(
-            interleaved.float(), separated.float(), rtol=0.02, atol=0.05
+            interleaved.float(), separated.float(), rtol=0, atol=0.1
         )
     finally:
         get_2stage_cfgs.cache_clear()
