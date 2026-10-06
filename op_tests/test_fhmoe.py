@@ -525,6 +525,7 @@ def _torch_routed_reference(
     weights: _Weights,
     profile: _Profile,
     activation_quantization: str = "fp8",
+    activation: str = "silu",
 ) -> torch.Tensor:
     """Dequantized FP32 reference for the routed A8W4 experts."""
     w1 = _dequant_fp4_weight(weights.raw_routed_w1, weights.raw_routed_s1)
@@ -546,7 +547,11 @@ def _torch_routed_reference(
         limit = _swiglu_limit(profile)
         gate = gate.clamp(max=limit)
         up = up.clamp(min=-limit, max=limit)
-        inter = F.silu(gate) * up
+        inter = (
+            gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+            if activation == "swiglu"
+            else F.silu(gate) * up
+        )
         if activation_quantization == "fp8":
             inter = inter.to(dtypes.bf16).float()
         inter = _activation_quant_dequant(inter, activation_quantization)
@@ -560,6 +565,7 @@ def _torch_shared_reference(
     weights: _Weights,
     group_size: int | str | None,
     swiglu_limit: float,
+    activation: str = "silu",
 ) -> torch.Tensor:
     w1 = _dequant_fp8_weight(weights.raw_native_w1, weights.raw_native_s1)
     w2 = _dequant_fp8_weight(weights.raw_native_w2, weights.raw_native_s2)
@@ -574,7 +580,11 @@ def _torch_shared_reference(
     gate, up = gate_up.chunk(2, dim=-1)
     gate = gate.clamp(max=swiglu_limit)
     up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
-    inter = F.silu(gate) * up
+    inter = (
+        gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+        if activation == "swiglu"
+        else F.silu(gate) * up
+    )
     if group_size == "fp4":
         inter = _fp4_group_quant_dequant(inter)
     elif group_size is not None:
@@ -1201,9 +1211,11 @@ def test_dsv4_i384_fhmoe_config_has_true_shapes():
         / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
     )
     with config_path.open(newline="") as f:
-        rows = list(csv.DictReader(f))
+        all_rows = list(csv.DictReader(f))
     with ordinary_path.open(newline="") as f:
         ordinary_rows = list(csv.DictReader(f))
+
+    rows = [row for row in all_rows if int(row["model_dim"]) == 7168]
 
     assert {int(row["token"]) for row in rows} == {
         1,
@@ -1252,13 +1264,30 @@ def test_fhmoe_aot_manifest_covers_native_i384():
     ordinary_fhmoe_jobs = [
         job for job in ordinary_jobs if job.get("shared_expert_id", -1) >= 0
     ]
+    dsv4_jobs = [job for job in dedicated_jobs if job["model_dim"] == 7168]
+    swiglu_i384_jobs = [
+        job
+        for job in dedicated_jobs
+        if job["model_dim"] == 6144 and job["inter_dim"] == 384
+    ]
+    swiglu_i768_jobs = [
+        job
+        for job in dedicated_jobs
+        if job["model_dim"] == 6144 and job["inter_dim"] == 768
+    ]
 
     assert not ordinary_fhmoe_jobs
-    assert len(dedicated_jobs) == 24
-    assert all(job["inter_dim"] == 384 for job in dedicated_jobs)
-    assert all(job["shared_expert_id"] == 384 for job in dedicated_jobs)
+    assert len(dsv4_jobs) == 24
+    assert len(swiglu_i384_jobs) == 24
+    assert len(swiglu_i768_jobs) == 24
+    assert all(job["inter_dim"] == 384 for job in dsv4_jobs)
+    assert all(job["shared_expert_id"] == 384 for job in dsv4_jobs)
+    assert all(
+        job["shared_expert_id"] == 128
+        for job in [*swiglu_i384_jobs, *swiglu_i768_jobs]
+    )
     assert all(not job.get("enable_bias", False) for job in dedicated_jobs)
-    assert {job["token_num"] for job in dedicated_jobs} == {
+    expected_tokens = {
         1,
         2,
         4,
@@ -1272,17 +1301,20 @@ def test_fhmoe_aot_manifest_covers_native_i384():
         1024,
         2048,
     }
+    assert {job["token_num"] for job in dsv4_jobs} == expected_tokens
+    assert {job["token_num"] for job in swiglu_i384_jobs} == expected_tokens
+    assert {job["token_num"] for job in swiglu_i768_jobs} == expected_tokens
     for job in dedicated_jobs:
         params = get_flydsl_kernel_params(job["kernel_name"])
         assert params is not None
         assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
         if job["stage"] == 1:
-            assert 384 % job["tile_n"] == 0
+            assert job["inter_dim"] % job["tile_n"] == 0
         else:
-            assert 384 % job["tile_k"] == 0
+            assert job["inter_dim"] % job["tile_k"] == 0
 
     m2048_names = {
-        job["kernel_name"] for job in dedicated_jobs if job["token_num"] == 2048
+        job["kernel_name"] for job in dsv4_jobs if job["token_num"] == 2048
     }
     assert m2048_names == {
         "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
@@ -1437,3 +1469,53 @@ def test_a4w4_routed_fp8_shared_heterogeneous_path(
     assert torch.isfinite(actual).all()
     error = _rel_l2(actual, routed_high + shared_high)
     assert error <= 5e-2, f"A4W4/FP8 heterogeneous FP32 error: {error:.3e}"
+
+
+@pytest.mark.parametrize("intermediate_size", [384, 768])
+def test_heterogeneous_moe_supports_swiglu(
+    monkeypatch: pytest.MonkeyPatch,
+    intermediate_size: int,
+):
+    profile = _Profile(6144, intermediate_size, intermediate_size, 129, 4)
+    weights = _build_weights(profile, interleave=True)
+    monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
+    monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "1")
+    hidden, routed_weight, routed_ids, all_weight, all_ids = _route_inputs(
+        profile, 4, weights.routed_w1.device
+    )
+    kwargs = _common_kwargs(profile, weights.routed_s1, weights.routed_s2)
+    kwargs.update(
+        activation=aiter.ActivationType.Swiglu,
+        shared_w1=weights.shared_w1,
+        shared_w2=weights.shared_w2,
+        shared_w1_scale=weights.shared_s1,
+        shared_w2_scale=weights.shared_s2,
+        shared_expert_id=profile.shared_id,
+    )
+
+    actual = fused_moe(
+        hidden,
+        weights.routed_w1,
+        weights.routed_w2,
+        all_weight,
+        all_ids,
+        **kwargs,
+    )
+    routed = _torch_routed_reference(
+        hidden,
+        routed_weight,
+        routed_ids,
+        weights,
+        profile,
+        activation="swiglu",
+    )
+    shared = _torch_shared_reference(
+        hidden,
+        weights,
+        32,
+        _swiglu_limit(profile),
+        activation="swiglu",
+    )
+
+    assert torch.isfinite(actual).all()
+    assert _rel_l2(actual, routed + shared) <= 5e-2

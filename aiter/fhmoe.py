@@ -56,8 +56,10 @@ def _validate_fhmoe_contract(
         raise ValueError(
             "Heterogeneous MXFP4/FP8 experts require per_1x32 quantization"
         )
-    if activation != ActivationType.Silu:
-        raise ValueError("Heterogeneous MXFP4/FP8 experts currently require SiLU")
+    if activation not in (ActivationType.Silu, ActivationType.Swiglu):
+        raise ValueError(
+            "Heterogeneous MXFP4/FP8 experts currently require SiLU or SwiGLU"
+        )
     if gate_mode not in (GateMode.INTERLEAVE, GateMode.SEPARATED):
         raise ValueError(
             "Heterogeneous MXFP4/FP8 experts require interleaved or "
@@ -399,6 +401,60 @@ def supports_dsv4_i384_fhmoe(max_tokens: int) -> bool:
     return _supports_dsv4_i384_fhmoe_config(max_tokens, config_file)
 
 
+@functools.cache
+def supports_mxfp4_mxfp8_swiglu_fhmoe(
+    max_tokens: int,
+    intermediate_size: int,
+) -> bool:
+    """Return whether AITER can dispatch heterogeneous MXFP4/MXFP8 MoE with SwiGLU."""
+    if type(max_tokens) is not int or max_tokens <= 0:
+        return False
+    if intermediate_size not in (384, 768):
+        return False
+
+    try:
+        from aiter.fused_moe import get_2stage_cfgs, get_padded_M
+
+        config_file = _dsv4_i384_fhmoe_config_file()
+
+        required_tokens = {
+            get_padded_M(1 << exponent) for exponent in range(max_tokens.bit_length())
+        }
+        required_tokens.add(get_padded_M(max_tokens))
+        for token in required_tokens:
+            metadata = get_2stage_cfgs(
+                token,
+                6144,
+                intermediate_size,
+                129,
+                5,
+                torch.bfloat16,
+                dtypes.fp8,
+                dtypes.fp4x2,
+                QuantType.per_1x32,
+                True,
+                ActivationType.Swiglu,
+                False,
+                0,
+                0,
+                True,
+                GateMode.INTERLEAVE,
+                swiglu_limit=7.0,
+                config_file=config_file,
+            )
+            _use_fhmoe_wrappers(metadata)
+    except (
+        ImportError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    return True
+
+
 def _is_dsv4_i384_fhmoe_contract(
     model_dim: int,
     inter_dim: int,
@@ -415,6 +471,29 @@ def _is_dsv4_i384_fhmoe_contract(
         and intermediate_pad == 0
         and gate_mode == GateMode.INTERLEAVE
         and not doweight_stage1
+    )
+
+
+def _is_mxfp4_mxfp8_swiglu_fhmoe_contract(
+    model_dim: int,
+    inter_dim: int,
+    experts: int,
+    topk: int,
+    hidden_pad: int,
+    intermediate_pad: int,
+    gate_mode: GateMode,
+    doweight_stage1: bool,
+    activation: ActivationType,
+) -> bool:
+    return (
+        model_dim == 6144
+        and inter_dim in (384, 768)
+        and (experts, topk) == (129, 5)
+        and hidden_pad == 0
+        and intermediate_pad == 0
+        and gate_mode == GateMode.INTERLEAVE
+        and not doweight_stage1
+        and activation == ActivationType.Swiglu
     )
 
 
@@ -584,6 +663,28 @@ def fhmoe_(
             raise NotImplementedError(
                 "The active FHMoE config does not cover this DSV4 I384 "
                 f"token shape: M={hidden_states.shape[0]}"
+            )
+        from aiter.jit.core import AITER_CONFIGS
+
+        metadata_config_file = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+    elif _is_mxfp4_mxfp8_swiglu_fhmoe_contract(
+        model_dim,
+        inter_dim,
+        experts,
+        topk,
+        hidden_pad,
+        intermediate_pad,
+        gate_mode_enum,
+        doweight_stage1,
+        activation_enum,
+    ):
+        if not supports_mxfp4_mxfp8_swiglu_fhmoe(
+            hidden_states.shape[0],
+            inter_dim,
+        ):
+            raise NotImplementedError(
+                "The active heterogeneous MXFP4/MXFP8 MoE config with SwiGLU "
+                f"does not cover this token shape: M={hidden_states.shape[0]}"
             )
         from aiter.jit.core import AITER_CONFIGS
 

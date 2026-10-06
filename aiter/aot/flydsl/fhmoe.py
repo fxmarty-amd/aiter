@@ -167,8 +167,8 @@ def precompile_fhmoe_to_cache(
         )
     if enable_bias:
         raise ValueError("FHMoE AOT does not support expert bias")
-    if act != "silu":
-        raise ValueError(f"FHMoE AOT supports only SiLU, got {act=}")
+    if act not in ("silu", "swiglu"):
+        raise ValueError(f"FHMoE AOT supports only SiLU or SwiGLU, got {act=}")
     if cu_num_to_arch(cu_num) != "gfx950":
         raise ValueError(f"FHMoE AOT supports only gfx950, got {cu_num=}")
 
