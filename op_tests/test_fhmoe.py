@@ -152,6 +152,7 @@ def _make_shared_weights(
     profile: _Profile,
     device: torch.device,
     interleave: bool = True,
+    native_mxfp8_scales: bool = False,
 ) -> tuple:
     generator = torch.Generator(device=device).manual_seed(17)
     h = profile.hidden
@@ -170,26 +171,42 @@ def _make_shared_weights(
     native_w1 = torch.cat((gate, up), dim=0).unsqueeze(0)
     native_w2 = down.unsqueeze(0)
 
-    s1_rows = 2 * logical_i // 128
-    s1_cols = h // 128
-    s2_rows = h // 128
-    s2_cols = logical_i // 128
-    native_block_s1 = (
-        126
-        + torch.arange(s1_rows * s1_cols, device=device, dtype=torch.uint8).view(
-            s1_rows, s1_cols
-        )
-        % 2
-    ).view(dtypes.fp8_e8m0)
-    native_block_s2 = (
-        126
-        + torch.arange(s2_rows * s2_cols, device=device, dtype=torch.uint8).view(
-            s2_rows, s2_cols
-        )
-        % 2
-    ).view(dtypes.fp8_e8m0)
-    native_s1 = _expand_128x128_scale(native_block_s1, 2 * logical_i, h)
-    native_s2 = _expand_128x128_scale(native_block_s2, h, logical_i)
+    if native_mxfp8_scales:
+        native_s1 = (
+            125
+            + torch.arange(
+                2 * logical_i * (h // 32), device=device, dtype=torch.uint8
+            ).view(2 * logical_i, h // 32)
+            % 4
+        ).view(dtypes.fp8_e8m0)
+        native_s2 = (
+            125
+            + torch.arange(
+                h * (logical_i // 32), device=device, dtype=torch.uint8
+            ).view(h, logical_i // 32)
+            % 4
+        ).view(dtypes.fp8_e8m0)
+    else:
+        s1_rows = 2 * logical_i // 128
+        s1_cols = h // 128
+        s2_rows = h // 128
+        s2_cols = logical_i // 128
+        native_block_s1 = (
+            126
+            + torch.arange(s1_rows * s1_cols, device=device, dtype=torch.uint8).view(
+                s1_rows, s1_cols
+            )
+            % 2
+        ).view(dtypes.fp8_e8m0)
+        native_block_s2 = (
+            126
+            + torch.arange(s2_rows * s2_cols, device=device, dtype=torch.uint8).view(
+                s2_rows, s2_cols
+            )
+            % 2
+        ).view(dtypes.fp8_e8m0)
+        native_s1 = _expand_128x128_scale(native_block_s1, 2 * logical_i, h)
+        native_s2 = _expand_128x128_scale(native_block_s2, h, logical_i)
 
     padded_w1 = torch.zeros((1, 2 * padded_i, h), dtype=dtypes.fp8, device=device)
     padded_w1[:, :logical_i] = gate
@@ -290,7 +307,11 @@ def _make_routed_weights(
     )
 
 
-def _build_weights(profile: _Profile, interleave: bool) -> _Weights:
+def _build_weights(
+    profile: _Profile,
+    interleave: bool,
+    native_mxfp8_scales: bool = False,
+) -> _Weights:
     if get_gfx() != "gfx950":
         pytest.skip("heterogeneous MXFP4/FP8 MoE requires gfx950")
     if "shared_w1" not in inspect.signature(fused_moe).parameters:
@@ -320,7 +341,12 @@ def _build_weights(profile: _Profile, interleave: bool) -> _Weights:
         raw_native_w2,
         raw_native_s1,
         raw_native_s2,
-    ) = _make_shared_weights(profile, device, interleave)
+    ) = _make_shared_weights(
+        profile,
+        device,
+        interleave,
+        native_mxfp8_scales=native_mxfp8_scales,
+    )
     return _Weights(
         routed_w1,
         routed_w2,
@@ -1202,6 +1228,61 @@ def test_dsv4_i384_fhmoe_config_requires_exact_bucket(
         )
 
 
+@pytest.mark.parametrize(
+    ("intermediate_size", "expected_stage1", "expected_stage2"),
+    [
+        (
+            384,
+            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
+        ),
+        (
+            768,
+            "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w4_gui_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t32x256x256_reduce",
+        ),
+    ],
+)
+def test_mxfp4_mxfp8_moe_config_falls_back_to_largest_tuned_tier(
+    monkeypatch: pytest.MonkeyPatch,
+    intermediate_size: int,
+    expected_stage1: str,
+    expected_stage2: str,
+):
+    import importlib
+
+    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
+    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
+    fused_moe_module.get_2stage_cfgs.cache_clear()
+    fused_moe_module.cfg_2stages_by_file.clear()
+
+    metadata = fused_moe_module.get_2stage_cfgs(
+        fused_moe_module.get_padded_M(4097),
+        6144,
+        intermediate_size,
+        129,
+        5,
+        torch.bfloat16,
+        dtypes.fp8,
+        dtypes.fp4x2,
+        aiter.QuantType.per_1x32,
+        True,
+        aiter.ActivationType.Swiglu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE,
+        swiglu_limit=7.0,
+        config_file=str(config_path),
+    )
+
+    assert metadata.stage1.keywords["kernelName"] == expected_stage1
+    assert metadata.stage2.keywords["kernelName"] == expected_stage2
+
+
 def test_dsv4_i384_fhmoe_config_has_true_shapes():
     import csv
 
@@ -1477,7 +1558,11 @@ def test_heterogeneous_moe_supports_swiglu(
     intermediate_size: int,
 ):
     profile = _Profile(6144, intermediate_size, intermediate_size, 129, 4)
-    weights = _build_weights(profile, interleave=True)
+    weights = _build_weights(
+        profile,
+        interleave=True,
+        native_mxfp8_scales=True,
+    )
     monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
     monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "1")
     hidden, routed_weight, routed_ids, all_weight, all_ids = _route_inputs(
