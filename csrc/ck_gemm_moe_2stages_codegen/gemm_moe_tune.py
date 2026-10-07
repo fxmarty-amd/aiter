@@ -27,6 +27,7 @@ from aiter import (
     dtypes,
 )
 from aiter.fused_moe import (
+    _fused_moe_impl,
     _mxfp4_a4w4_stage1_fw,
     _mxfp4_a4w4_stage2_fw,
     asm_stage1,
@@ -45,6 +46,7 @@ from aiter.int4_utils import (
     rearrange_4bit_elements,
 )
 from aiter.jit.core import (
+    AITER_CONFIG_FHMOE,
     AITER_CONFIG_FMOE,
     AITER_CONFIG_GROUPED_FMOE,
     AITER_CSRC_DIR,
@@ -70,7 +72,11 @@ from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
     parse_g2_kname_any,
 )
-from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
+from aiter.ops.quant import (
+    per_1x32_f4_quant,
+    per_1x32_f8_scale_f8_quant,
+    per_1x32_i4_quant,
+)
 from aiter.ops.shuffle import (
     pack_int8_to_packed_int4,
     shuffle_scale,
@@ -493,6 +499,29 @@ class FmoeTuner(TunerCommon):
             help="Only last kernel is tuned, if not, only kernels that are not in the tuned_fmoe.csv are tuned",
         )
         self.parser.add_argument(
+            "--fhmoe",
+            action="store_true",
+            required=False,
+            help="Tune heterogeneous MXFP4-routed/MXFP8-shared FlyDSL MoE.",
+        )
+        self.parser.add_argument(
+            "--fhmoe-top-candidates",
+            type=int,
+            default=3,
+            help="Retain this many stage candidates per block_m for FHMoE e2e reranking.",
+        )
+        self.parser.add_argument(
+            "--fhmoe-skip-precompile",
+            action="store_true",
+            help="Skip the parallel FHMoE AOT precompile phase.",
+        )
+        self.parser.add_argument(
+            "--fhmoe-compile-workers",
+            type=int,
+            default=0,
+            help="FHMoE AOT compiler workers (default: min(16, 4 * --mp)).",
+        )
+        self.parser.add_argument(
             "--grouped-gemm",
             action="store_true",
             required=False,
@@ -513,6 +542,15 @@ class FmoeTuner(TunerCommon):
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
+        if sum((bool(args.fhmoe), bool(args.grouped_gemm), bool(args.mxfp4_flydsl))) > 1:
+            self.parser.error(
+                "--fhmoe, --grouped-gemm, and --mxfp4-flydsl are mutually exclusive"
+            )
+        if args.fhmoe and (args.compare or args.e2e_tune or args.run_config):
+            self.parser.error(
+                "--fhmoe already selects candidates by end-to-end latency; "
+                "--compare, --e2e_tune, and --run_config are not supported yet"
+            )
         # None distinguishes an omitted mode from an explicit prune request.
         if args.mxfp4_search_mode is not None and (
             not args.mxfp4_flydsl
@@ -5874,6 +5912,20 @@ class FmoeTuner(TunerCommon):
             return pd.DataFrame()
 
     def pre_process(self, args):
+        fhmoe_columns = {
+            "shared_expert_id",
+            "hidden_pad",
+            "intermediate_pad",
+            "gate_mode",
+        }
+        input_columns = set(pd.read_csv(args.untune_file, nrows=0).columns)
+        if fhmoe_columns.issubset(input_columns) and not isinstance(self, FhmoeTuner):
+            raise ValueError(
+                "heterogeneous MoE input requires --fhmoe; without it the tuner "
+                "would ignore the shared-expert fields and benchmark homogeneous "
+                "routed weights"
+            )
+
         if args.all:
             self.get_retune_gemm_list(args)
         else:
@@ -6139,6 +6191,845 @@ class FmoeTuner(TunerCommon):
             print(f"{output_file} has been updated with {len(tune_results)} entries!")
         else:
             print("No improvements found during e2e tuning.")
+
+
+class FhmoeTuner(FmoeTuner):
+    """Tune the real MXFP4-routed/MXFP8-shared FlyDSL pipeline.
+
+    Stage candidates are first ranked while paired with a known-correct anchor
+    for the same sorting block size. The fastest candidates from each side are
+    then reranked as complete pipelines. Every timing therefore includes the
+    heterogeneous shared-expert branch; the final choice is always end-to-end.
+    """
+
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
+        **FmoeTuner.ARG_DEFAULTS,
+        "tune_file": f"{AITER_CONFIG_FHMOE}",
+        "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/untuned_fhmoe.csv",
+        "errRatio": 0.01,
+        "profile_file": "",
+        "config_env_name": "AITER_CONFIG_FHMOE",
+    }
+
+    SHAPE_KEYS: ClassVar[list[str]] = [
+        "gfx",
+        "cu_num",
+        "token",
+        "model_dim",
+        "inter_dim",
+        "expert",
+        "topk",
+        "shared_expert_id",
+        "act_type",
+        "dtype",
+        "q_dtype_a",
+        "q_dtype_w",
+        "q_type",
+        "use_g1u1",
+        "doweight_stage1",
+        "hidden_pad",
+        "intermediate_pad",
+        "gate_mode",
+    ]
+
+    @staticmethod
+    def _mark_shuffled(tensor):
+        tensor.is_shuffled = True
+        return tensor
+
+    @classmethod
+    def _make_data(cls, row, device="cuda"):
+        token = int(row["token"])
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
+        experts = int(row["expert"])
+        topk = int(row["topk"])
+        shared_id = int(row["shared_expert_id"])
+        if shared_id != experts - 1:
+            raise ValueError(
+                f"FHMoE requires shared_expert_id == expert - 1, got {shared_id=} "
+                f"and {experts=}"
+            )
+        routed_topk = topk - 1
+        if routed_topk < 1 or routed_topk > shared_id:
+            raise ValueError(f"invalid routed top-k {routed_topk} for {shared_id} experts")
+
+        generator = torch.Generator(device=device).manual_seed(
+            1701 + token + 17 * inter_dim
+        )
+        hidden = torch.randn(
+            (token, model_dim),
+            dtype=dtypes.bf16,
+            device=device,
+            generator=generator,
+        )
+
+        # Match the established FHMoE correctness oracle: populate every expert
+        # reachable by the synthetic routing and leave the remaining storage at
+        # exact zero. This keeps setup bounded even for E=385 while exercising
+        # the real heterogeneous addressing and shared-expert branch.
+        routed_w1_u8 = torch.zeros(
+            (shared_id, 2 * inter_dim, model_dim // 2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        routed_w2_u8 = torch.zeros(
+            (shared_id, model_dim, inter_dim // 2),
+            dtype=torch.uint8,
+            device=device,
+        )
+        routed_s1_u8 = torch.full(
+            (shared_id, 2 * inter_dim, model_dim // 32),
+            0x7F,
+            dtype=torch.uint8,
+            device=device,
+        )
+        routed_s2_u8 = torch.full(
+            (shared_id, model_dim, inter_dim // 32),
+            0x7F,
+            dtype=torch.uint8,
+            device=device,
+        )
+        for expert_id in range(routed_topk):
+            scale = 0.02 + 0.005 * expert_id
+            dense_w1 = (
+                torch.randn(
+                    (1, 2 * inter_dim, model_dim),
+                    dtype=dtypes.bf16,
+                    device=device,
+                    generator=generator,
+                )
+                * scale
+            )
+            dense_w2 = (
+                torch.randn(
+                    (1, model_dim, inter_dim),
+                    dtype=dtypes.bf16,
+                    device=device,
+                    generator=generator,
+                )
+                * scale
+            )
+            quant_w1, quant_s1 = per_1x32_f4_quant(dense_w1)
+            quant_w2, quant_s2 = per_1x32_f4_quant(dense_w2)
+            routed_w1_u8[expert_id].copy_(quant_w1[0].view(torch.uint8))
+            routed_w2_u8[expert_id].copy_(quant_w2[0].view(torch.uint8))
+            routed_s1_u8[expert_id].copy_(quant_s1.view(torch.uint8))
+            routed_s2_u8[expert_id].copy_(quant_s2.view(torch.uint8))
+        routed_w1_raw = routed_w1_u8.view(dtypes.fp4x2)
+        routed_w2_raw = routed_w2_u8.view(dtypes.fp4x2)
+        routed_s1_raw = routed_s1_u8.view(dtypes.fp8_e8m0)
+        routed_s2_raw = routed_s2_u8.view(dtypes.fp8_e8m0)
+
+        # The physical routed tensors retain the logical shared row because the
+        # sorter uses expert ids [0, expert). The FH wrappers substitute the
+        # separate FP8 pointers whenever sorted_expert_id == shared_id.
+        dummy_w1 = torch.zeros(
+            (1, 2 * inter_dim, model_dim // 2),
+            dtype=torch.uint8,
+            device=device,
+        ).view(dtypes.fp4x2)
+        dummy_w2 = torch.zeros(
+            (1, model_dim, inter_dim // 2), dtype=torch.uint8, device=device
+        ).view(dtypes.fp4x2)
+        dummy_s1 = torch.full(
+            (1, 2 * inter_dim, model_dim // 32),
+            0x7F,
+            dtype=torch.uint8,
+            device=device,
+        ).view(dtypes.fp8_e8m0)
+        dummy_s2 = torch.full(
+            (1, model_dim, inter_dim // 32),
+            0x7F,
+            dtype=torch.uint8,
+            device=device,
+        ).view(dtypes.fp8_e8m0)
+
+        all_w1_raw = torch.cat((routed_w1_raw, dummy_w1), dim=0)
+        all_w2_raw = torch.cat((routed_w2_raw, dummy_w2), dim=0)
+        all_s1_raw = torch.cat((routed_s1_raw, dummy_s1), dim=0)
+        all_s2_raw = torch.cat((routed_s2_raw, dummy_s2), dim=0)
+
+        all_w1 = cls._mark_shuffled(shuffle_weight_a16w4(all_w1_raw, 16, True))
+        all_w2 = cls._mark_shuffled(shuffle_weight_a16w4(all_w2_raw, 16, False))
+        all_s1 = shuffle_scale_a16w4(
+            all_s1_raw.view(-1, all_s1_raw.shape[-1]), experts, True
+        )
+        all_s2 = shuffle_scale_a16w4(
+            all_s2_raw.view(-1, all_s2_raw.shape[-1]), experts, False
+        )
+        # Slice the already-preshuffled full tensors exactly as the production
+        # unfused oracle does. Re-shuffling an E-1 tensor can produce a different
+        # scale layout from the prefix consumed by the heterogeneous E tensor.
+        routed_w1 = cls._mark_shuffled(all_w1[:shared_id])
+        routed_w2 = cls._mark_shuffled(all_w2[:shared_id])
+        routed_s1 = all_s1[: shared_id * 2 * inter_dim]
+        routed_s2 = all_s2[: shared_id * model_dim]
+
+        shared_w1_raw = (
+            torch.randn(
+                (1, 2 * inter_dim, model_dim),
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * 0.04
+        ).to(dtypes.fp8)
+        shared_w2_raw = (
+            torch.randn(
+                (1, model_dim, inter_dim),
+                dtype=torch.float32,
+                device=device,
+                generator=generator,
+            )
+            * 0.04
+        ).to(dtypes.fp8)
+        shared_s1_raw = (
+            125
+            + torch.arange(
+                2 * inter_dim * (model_dim // 32),
+                dtype=torch.uint8,
+                device=device,
+            ).view(1, 2 * inter_dim, model_dim // 32)
+            % 4
+        ).view(dtypes.fp8_e8m0)
+        shared_s2_raw = (
+            125
+            + torch.arange(
+                model_dim * (inter_dim // 32),
+                dtype=torch.uint8,
+                device=device,
+            ).view(1, model_dim, inter_dim // 32)
+            % 4
+        ).view(dtypes.fp8_e8m0)
+        shared_w1 = cls._mark_shuffled(
+            shuffle_weight_a16w4(shared_w1_raw, 16, True)
+        )
+        shared_w2 = cls._mark_shuffled(
+            shuffle_weight_a16w4(shared_w2_raw, 16, False)
+        )
+        shared_s1 = shuffle_scale_a16w4(
+            shared_s1_raw.view(-1, shared_s1_raw.shape[-1]), 1, True
+        )
+        shared_s2 = shuffle_scale_a16w4(
+            shared_s2_raw.view(-1, shared_s2_raw.shape[-1]), 1, False
+        )
+
+        token_idx = torch.arange(token, dtype=dtypes.i32, device=device)[:, None]
+        slot_idx = torch.arange(routed_topk, dtype=dtypes.i32, device=device)[None, :]
+        # Keep the validation distribution identical to the established FHMoE
+        # correctness oracle. Candidate timing still exercises the full tensor
+        # footprint; routing-distribution sweeps can be added independently.
+        routed_ids = (token_idx + slot_idx) % routed_topk
+        shared_ids = torch.full(
+            (token, 1), shared_id, dtype=dtypes.i32, device=device
+        )
+        topk_ids = torch.cat((routed_ids, shared_ids), dim=1)
+        routed_weights = torch.arange(
+            1,
+            routed_topk + 1,
+            dtype=torch.float32,
+            device=device,
+        ).repeat(token, 1)
+        routed_weights = (
+            routed_weights / routed_weights.sum(dim=1, keepdim=True) * 2.5
+        )
+        shared_weights = torch.ones(
+            (token, 1), dtype=torch.float32, device=device
+        )
+        routing = torch.cat((routed_weights, shared_weights), dim=1)
+
+        return {
+            "hidden": hidden,
+            "all_w1": all_w1,
+            "all_w2": all_w2,
+            "all_s1": all_s1,
+            "all_s2": all_s2,
+            "shared_w1": shared_w1,
+            "shared_w2": shared_w2,
+            "shared_s1": shared_s1,
+            "shared_s2": shared_s2,
+            "topk_ids": topk_ids,
+            "topk_weights": routing,
+            "routed_w1": routed_w1,
+            "routed_w2": routed_w2,
+            "routed_s1": routed_s1,
+            "routed_s2": routed_s2,
+            "routed_w1_raw": routed_w1_raw[:routed_topk],
+            "routed_w2_raw": routed_w2_raw[:routed_topk],
+            "routed_s1_raw": routed_s1_raw[:routed_topk],
+            "routed_s2_raw": routed_s2_raw[:routed_topk],
+            "shared_w1_raw": shared_w1_raw,
+            "shared_w2_raw": shared_w2_raw,
+            "shared_s1_raw": shared_s1_raw,
+            "shared_s2_raw": shared_s2_raw,
+            "routed_ids": routed_ids,
+            "routed_weights": routed_weights,
+            "shared_ids": torch.zeros_like(shared_ids),
+            "shared_weights": shared_weights,
+        }
+
+    @staticmethod
+    def _activation(row):
+        return eval(str(row["act_type"]))
+
+    @staticmethod
+    def _dequant_fp4(weight, scale):
+        scale_f32 = fp4_utils.e8m0_to_f32(scale).repeat_interleave(32, dim=-1)
+        return fp4_utils.mxfp4_to_f32(weight) * scale_f32
+
+    @staticmethod
+    def _dequant_fp8(weight, scale):
+        scale_f32 = fp4_utils.e8m0_to_f32(scale).repeat_interleave(32, dim=-1)
+        return weight.float() * scale_f32
+
+    @staticmethod
+    def _mxfp8_quant_dequant(value):
+        value_bytes, scale = torch_dynamic_mxfp8_quant(value)
+        scale_f32 = fp4_utils.e8m0_to_f32(scale).repeat_interleave(32, dim=-1)
+        return value_bytes.view(dtypes.fp8).float() * scale_f32
+
+    @staticmethod
+    def _activate(gate, up, activation, limit):
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        if activation == ActivationType.Swiglu:
+            return gate * torch.sigmoid(1.702 * gate) * (up + 1.0)
+        if activation == ActivationType.Silu:
+            return F.silu(gate) * up
+        raise ValueError(f"unsupported FHMoE activation: {activation}")
+
+    @classmethod
+    def _composed_reference(cls, row, data):
+        activation = cls._activation(row)
+        limit = 7.0 if activation == ActivationType.Swiglu else float("inf")
+        hidden = cls._mxfp8_quant_dequant(data["hidden"].float())
+
+        routed_w1 = cls._dequant_fp4(
+            data["routed_w1_raw"], data["routed_s1_raw"]
+        )
+        routed_w2 = cls._dequant_fp4(
+            data["routed_w2_raw"], data["routed_s2_raw"]
+        )
+        routed_ids = data["routed_ids"]
+        expanded = hidden[:, None, :].expand(-1, routed_ids.shape[1], -1)
+        routed_slots = torch.zeros(
+            (*routed_ids.shape, int(row["model_dim"])),
+            dtype=torch.float32,
+            device=hidden.device,
+        )
+        for expert_id in range(routed_ids.shape[1]):
+            mask = routed_ids == expert_id
+            gate_up = F.linear(expanded[mask], routed_w1[expert_id])
+            gate, up = gate_up.chunk(2, dim=-1)
+            inter = cls._activate(gate, up, activation, limit)
+            inter = cls._mxfp8_quant_dequant(inter.to(dtypes.bf16).float())
+            routed_slots[mask] = F.linear(inter, routed_w2[expert_id])
+        routed = (routed_slots * data["routed_weights"][..., None]).sum(dim=1)
+
+        shared_w1 = cls._dequant_fp8(
+            data["shared_w1_raw"], data["shared_s1_raw"]
+        )
+        shared_w2 = cls._dequant_fp8(
+            data["shared_w2_raw"], data["shared_s2_raw"]
+        )
+        shared_gate_up = F.linear(hidden, shared_w1[0])
+        shared_gate, shared_up = shared_gate_up.chunk(2, dim=-1)
+        shared_inter = cls._activate(
+            shared_gate, shared_up, activation, limit
+        ).to(dtypes.bf16)
+        shared_inter = cls._mxfp8_quant_dequant(shared_inter.float())
+        shared = F.linear(shared_inter, shared_w2[0]) * data["shared_weights"]
+        return routed + shared
+
+    @staticmethod
+    def _distributed_timing_data(row, data):
+        """Reuse validated tensors while spreading routed work over all experts."""
+        timing_data = dict(data)
+        token = int(row["token"])
+        routed_topk = int(row["topk"]) - 1
+        shared_id = int(row["shared_expert_id"])
+        token_idx = torch.arange(
+            token, dtype=dtypes.i32, device=data["hidden"].device
+        )[:, None]
+        slot_idx = torch.arange(
+            routed_topk, dtype=dtypes.i32, device=data["hidden"].device
+        )[None, :]
+        routed_ids = (token_idx * routed_topk + slot_idx * 17) % shared_id
+        timing_data["routed_ids"] = routed_ids
+        timing_data["topk_ids"] = torch.cat(
+            (
+                routed_ids,
+                torch.full(
+                    (token, 1),
+                    shared_id,
+                    dtype=dtypes.i32,
+                    device=data["hidden"].device,
+                ),
+            ),
+            dim=1,
+        )
+        return timing_data
+
+    @staticmethod
+    def _candidate_row(row, block_m, kernel1, kernel2):
+        result = {key: row[key] for key in FhmoeTuner.SHAPE_KEYS}
+        result.update(
+            {
+                "block_m": int(block_m),
+                "ksplit": 0,
+                "kernelName1": kernel1,
+                "kernelName2": kernel2,
+            }
+        )
+        return result
+
+    @staticmethod
+    def _candidate_sets(row):
+        model_dim = int(row["model_dim"])
+        inter_dim = int(row["inter_dim"])
+        s1_registry = get_flydsl_stage1_kernels("fp8", "fp4", "bf16")
+        s2_registry = get_flydsl_stage2_kernels("fp8", "fp4", "bf16")
+        kernel_regex = os.environ.get("TUNE_MOE_KERNEL_REGEX")
+        pattern = re.compile(kernel_regex) if kernel_regex else None
+        result = {}
+        for block_m in (16, 32, 64, 128):
+            stage1 = []
+            for name, params in s1_registry.items():
+                if params["tile_m"] != block_m or params.get("k_batch", 1) != 1:
+                    continue
+                if inter_dim % params["tile_n"] != 0:
+                    continue
+                if model_dim % params["tile_k"] != 0:
+                    continue
+                if params.get("gate_mode", "separated") != "interleave":
+                    continue
+                variants = (name, name + "_fp8")
+                stage1.extend(
+                    variant
+                    for variant in variants
+                    if pattern is None or pattern.search(variant)
+                )
+            stage2 = []
+            for name, params in s2_registry.items():
+                if params["tile_m"] != block_m:
+                    continue
+                if inter_dim % params["tile_k"] != 0:
+                    continue
+                if model_dim % params["tile_n"] != 0:
+                    continue
+                if pattern is None or pattern.search(name):
+                    stage2.append(name)
+            if stage1 and stage2:
+                result[block_m] = (sorted(set(stage1)), sorted(set(stage2)))
+        return result
+
+    @classmethod
+    def _existing_candidate(cls, row):
+        from aiter.jit.core import AITER_CONFIGS
+
+        config_file = AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE
+        if not os.path.exists(config_file):
+            return None
+        tuned = pd.read_csv(config_file, dtype=str)
+        if not set(cls.SHAPE_KEYS).issubset(tuned.columns):
+            return None
+        wanted = tuple(str(row[key]) for key in cls.SHAPE_KEYS)
+        matches = tuned[
+            tuned[cls.SHAPE_KEYS].apply(tuple, axis=1) == wanted
+        ]
+        if len(matches) != 1:
+            return None
+        current = matches.iloc[0]
+        return cls._candidate_row(
+            row,
+            int(current["block_m"]),
+            current["kernelName1"],
+            current["kernelName2"],
+        )
+
+    @classmethod
+    def _precompile_rows(cls, rows, args):
+        """Compile candidate specializations in parallel before GPU timing.
+
+        Shape-parallel tuning otherwise makes several processes request the
+        same JIT artifacts concurrently. AOT jobs are generated through the
+        production CSV parser so their cache keys match runtime exactly.
+        """
+        if args.fhmoe_skip_precompile or not rows:
+            return
+
+        from aiter.aot.flydsl.common import run_jobs_parallel
+        from aiter.aot.flydsl.moe import compile_one_config, parse_csv
+
+        candidate_rows = []
+        for row in rows:
+            for block_m, (stage1, stage2) in cls._candidate_sets(row).items():
+                anchor2 = stage2[0]
+                candidate_rows.extend(
+                    cls._candidate_row(row, block_m, kernel1, anchor2)
+                    for kernel1 in stage1
+                )
+                fused_stage1 = next(
+                    (kernel for kernel in stage1 if kernel.endswith("_fp8")),
+                    stage1[0],
+                )
+                unfused_stage1 = next(
+                    (kernel for kernel in stage1 if not kernel.endswith("_fp8")),
+                    stage1[0],
+                )
+                for kernel2 in stage2:
+                    candidate_rows.append(
+                        cls._candidate_row(
+                            row, block_m, unfused_stage1, kernel2
+                        )
+                    )
+                    candidate_rows.append(
+                        cls._candidate_row(row, block_m, fused_stage1, kernel2)
+                    )
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv") as csv_file:
+            pd.DataFrame(candidate_rows).to_csv(csv_file.name, index=False)
+            jobs = parse_csv(csv_file.name)
+
+        # token_num and block_m only size the fake buffers used to trigger AOT;
+        # they are not arguments of compile_mixed_fhmoe_gemm{1,2}. Likewise,
+        # stage1_fuse_quant selects a dummy scale-buffer shape but is not part of
+        # the stage2 compiler specialization. Drop those runtime-only fields so
+        # every actual kernel specialization is compiled exactly once.
+        compile_key_fields = (
+            "kernel_name",
+            "model_dim",
+            "inter_dim",
+            "experts",
+            "topk",
+            "doweight_stage1",
+            "cu_num",
+            "act",
+            "enable_bias",
+            "shared_expert_id",
+            "stage",
+        )
+        unique_jobs = {}
+        for job in jobs:
+            key = tuple(job.get(field) for field in compile_key_fields)
+            unique_jobs.setdefault(key, job)
+        jobs = list(unique_jobs.values())
+
+        old_workers = os.environ.get("AITER_FLYDSL_AOT_WORKERS")
+        compile_workers = int(args.fhmoe_compile_workers)
+        if compile_workers <= 0:
+            compile_workers = min(16, max(1, 4 * int(args.mp)))
+        os.environ["AITER_FLYDSL_AOT_WORKERS"] = str(compile_workers)
+        try:
+            print(
+                f"[fhmoe] precompiling {len(jobs)} unique AOT jobs with "
+                f"{compile_workers} workers",
+                flush=True,
+            )
+            results = run_jobs_parallel(compile_one_config, jobs)
+        finally:
+            if old_workers is None:
+                os.environ.pop("AITER_FLYDSL_AOT_WORKERS", None)
+            else:
+                os.environ["AITER_FLYDSL_AOT_WORKERS"] = old_workers
+
+        failed = [result for result in results if result.get("compile_time") is None]
+        if args.profile_file:
+            pd.DataFrame(results).to_csv(
+                f"{args.profile_file}.compile.csv", index=False
+            )
+        if failed:
+            names = ", ".join(str(result.get("kernel_name")) for result in failed[:10])
+            raise RuntimeError(
+                f"FHMoE precompile failed for {len(failed)} jobs: {names}"
+            )
+
+    @classmethod
+    def _run_pipeline(cls, row, data, config_path):
+        from aiter.fhmoe import _use_fhmoe_wrappers
+        activation = cls._activation(row)
+        return _fused_moe_impl(
+            hidden_states=data["hidden"],
+            w1=data["all_w1"],
+            w2=data["all_w2"],
+            topk_weight=data["topk_weights"],
+            topk_ids=data["topk_ids"],
+            activation=activation.value,
+            quant_type=QuantType.per_1x32.value,
+            doweight_stage1=bool(int(row["doweight_stage1"])),
+            w1_scale=data["all_s1"],
+            w2_scale=data["all_s2"],
+            dtype=dtypes.bf16,
+            hidden_pad=int(row["hidden_pad"]),
+            intermediate_pad=int(row["intermediate_pad"]),
+            swiglu_limit=7.0 if activation == ActivationType.Swiglu else None,
+            gate_mode=str(row["gate_mode"]).split(".")[-1].lower(),
+            _q_dtype_a=dtypes.fp8,
+            _metadata_transform=_use_fhmoe_wrappers,
+            _metadata_config_file=config_path,
+            _stage1_extra_args={
+                "shared_w1": data["shared_w1"],
+                "shared_w1_scale": data["shared_s1"],
+                "shared_expert_id": int(row["shared_expert_id"]),
+                "swiglu_limit": 7.0 if activation == ActivationType.Swiglu else None,
+            },
+            _stage2_extra_args={
+                "shared_w2": data["shared_w2"],
+                "shared_w2_scale": data["shared_s2"],
+                "shared_expert_id": int(row["shared_expert_id"]),
+            },
+        )
+
+    @classmethod
+    def _measure_candidate(
+        cls,
+        row,
+        validation_data,
+        timing_data,
+        reference,
+        candidate,
+        args,
+        config_path,
+    ):
+        from aiter.fused_moe import cfg_2stages_by_file, get_2stage_cfgs
+
+        pd.DataFrame([candidate]).to_csv(config_path, index=False)
+        get_2stage_cfgs.cache_clear()
+        cfg_2stages_by_file.pop(config_path, None)
+        output = cls._run_pipeline(row, validation_data, config_path)
+        output_f32 = output.float().flatten()
+        reference_f32 = reference.float().flatten()
+        denominator = (
+            output_f32.square() + reference_f32.square()
+        ).sum().clamp_min(1e-24)
+        cosine_distance = float(
+            1 - 2 * (output_f32 * reference_f32).sum() / denominator
+        )
+        if (
+            not math.isfinite(cosine_distance)
+            or cosine_distance > float(args.errRatio)
+        ):
+            raise RuntimeError(
+                f"cosine distance {cosine_distance:.6g} exceeds {args.errRatio}"
+            )
+        from aiter.test_common import run_perftest
+
+        _, us = run_perftest(
+            lambda: cls._run_pipeline(row, timing_data, config_path),
+            num_warmup=int(args.warmup),
+            num_iters=int(args.iters),
+            use_cuda_event=True,
+        )
+        return float(us), cosine_distance
+
+    @classmethod
+    def _tune_one_shape(cls, row, args):
+        validation_data = cls._make_data(row)
+        timing_data = cls._distributed_timing_data(row, validation_data)
+        reference = cls._composed_reference(row, validation_data)
+        spaces = cls._candidate_sets(row)
+        top_n = max(1, int(args.fhmoe_top_candidates))
+        profile = []
+        best = None
+        measured_cache = {}
+        with tempfile.TemporaryDirectory(prefix="aiter_fhmoe_tune_") as tmpdir:
+            config_path = os.path.join(tmpdir, "candidate.csv")
+
+            def measure(block_m, kernel1, kernel2):
+                nonlocal best
+                cache_key = (block_m, kernel1, kernel2)
+                if cache_key not in measured_cache:
+                    candidate = cls._candidate_row(
+                        row, block_m, kernel1, kernel2
+                    )
+                    us, err = cls._measure_candidate(
+                        row,
+                        validation_data,
+                        timing_data,
+                        reference,
+                        candidate,
+                        args,
+                        config_path,
+                    )
+                    measured_cache[cache_key] = {
+                        **candidate,
+                        "us": us,
+                        "err": err,
+                    }
+                    profile.append(measured_cache[cache_key])
+                    if best is None or measured_cache[cache_key]["us"] < best["us"]:
+                        best = measured_cache[cache_key]
+                return measured_cache[cache_key]
+
+            existing = cls._existing_candidate(row)
+            if existing is not None:
+                try:
+                    best = measure(
+                        int(existing["block_m"]),
+                        existing["kernelName1"],
+                        existing["kernelName2"],
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    if args.verbose:
+                        print(f"[fhmoe] existing config failed validation: {exc}")
+
+            for block_m, (stage1, stage2) in spaces.items():
+                anchor = None
+                for kernel1 in stage1:
+                    for kernel2 in stage2:
+                        try:
+                            measure(block_m, kernel1, kernel2)
+                            anchor = (kernel1, kernel2)
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            if args.verbose:
+                                print(f"[fhmoe] anchor failed: {kernel1}/{kernel2}: {exc}")
+                    if anchor is not None:
+                        break
+                if anchor is None:
+                    continue
+
+                anchor1, anchor2 = anchor
+                ranked1 = []
+                for kernel1 in stage1:
+                    try:
+                        measured = measure(block_m, kernel1, anchor2)
+                    except Exception as exc:  # noqa: BLE001
+                        if args.verbose:
+                            print(f"[fhmoe] stage1 failed: {kernel1}: {exc}")
+                        continue
+                    ranked1.append((measured["us"], kernel1))
+
+                ranked2 = []
+                for kernel2 in stage2:
+                    try:
+                        measured = measure(block_m, anchor1, kernel2)
+                    except Exception as exc:  # noqa: BLE001
+                        if args.verbose:
+                            print(f"[fhmoe] stage2 failed: {kernel2}: {exc}")
+                        continue
+                    ranked2.append((measured["us"], kernel2))
+
+                for _, kernel1 in sorted(ranked1)[:top_n]:
+                    for _, kernel2 in sorted(ranked2)[:top_n]:
+                        try:
+                            measured = measure(block_m, kernel1, kernel2)
+                        except Exception as exc:  # noqa: BLE001
+                            if args.verbose:
+                                print(f"[fhmoe] pair failed: {kernel1}/{kernel2}: {exc}")
+                            continue
+            if args.profile_file and profile:
+                import fcntl
+
+                profile_df = pd.DataFrame(profile)
+                with open(args.profile_file, "a+") as profile_output:
+                    fcntl.flock(profile_output, fcntl.LOCK_EX)
+                    profile_output.seek(0, os.SEEK_END)
+                    profile_df.to_csv(
+                        profile_output,
+                        index=False,
+                        header=profile_output.tell() == 0,
+                    )
+        if best is None:
+            raise RuntimeError(
+                "no valid heterogeneous FlyDSL candidate for "
+                + ", ".join(f"{key}={row[key]}" for key in cls.SHAPE_KEYS)
+            )
+        print(
+            f"[fhmoe] token={row['token']} inter={row['inter_dim']} "
+            f"best={best['kernelName1']} + {best['kernelName2']} "
+            f"{best['us']:.4f} us err={best['err']:.3%}",
+            flush=True,
+        )
+        return best
+
+    def pre_process(self, args):
+        self.untunedf = self.get_untuned_gemm_list(args.untune_file)
+        missing = set(self.SHAPE_KEYS).difference(self.untunedf.columns)
+        if missing:
+            raise ValueError(f"FHMoE untuned CSV is missing columns: {sorted(missing)}")
+        runtime_gfx = get_gfx_runtime()
+        runtime_cu = self.get_cu_num()
+        self.untunedf = self.untunedf[
+            (self.untunedf["gfx"] == runtime_gfx)
+            & (self.untunedf["cu_num"] == runtime_cu)
+        ].copy()
+        self.untunedf = self.untunedf[self.SHAPE_KEYS].drop_duplicates()
+        for _, row in self.untunedf.iterrows():
+            expected = {
+                "shared_expert_id": int(row["expert"]) - 1,
+                "dtype": "torch.bfloat16",
+                "q_dtype_a": "torch.float8_e4m3fn",
+                "q_dtype_w": "torch.float4_e2m1fn_x2",
+                "q_type": "QuantType.per_1x32",
+                "use_g1u1": 1,
+                "doweight_stage1": 0,
+                "gate_mode": "GateMode.INTERLEAVE",
+            }
+            for column, value in expected.items():
+                if str(row[column]) != str(value):
+                    raise ValueError(
+                        f"unsupported FHMoE row: expected {column}={value}, "
+                        f"got {row[column]}"
+                    )
+        if args.last:
+            self.untunedf = self.untunedf.iloc[-1:]
+        self._precompile_rows(
+            [row.to_dict() for _, row in self.untunedf.iterrows()], args
+        )
+        self.tunedf = self.get_tuned_gemm_list(self.get_out_file(args.tune_file))
+        if not args.all and not self.tunedf.empty:
+            tuned_keys = set(
+                self.tunedf[self.SHAPE_KEYS].astype(str).apply(tuple, axis=1)
+            )
+            mask = self.untunedf.astype(str).apply(tuple, axis=1).isin(tuned_keys)
+            self.untunedf = self.untunedf[~mask].reset_index(drop=True)
+
+    def tune(self, untunedf, tunedf, args):
+        del tunedf
+        rows = [row.to_dict() for _, row in untunedf.iterrows()]
+        mp_num = max(1, min(int(args.mp), torch.cuda.device_count(), len(rows)))
+        if mp_num == 1:
+            return [self._tune_one_shape(row, args) for row in rows]
+        import multiprocessing as _mp
+
+        print(f"[fhmoe] tuning {len(rows)} shapes across {mp_num} GPUs", flush=True)
+        ctx = _mp.get_context("spawn")
+        payloads = [(self.SHAPE_KEYS, row, args, None) for row in rows]
+        results = _run_shapes_isolated(
+            payloads, mp_num, ctx, entry=_fhmoe_shape_proc
+        )
+        return [result for result in results if result is not None]
+
+    def post_process(self, results, args, topk=-1, fast_mode=False):
+        del args, topk, fast_mode
+        columns = self.SHAPE_KEYS + [
+            "block_m",
+            "ksplit",
+            "kernelName1",
+            "kernelName2",
+        ]
+        return pd.DataFrame(results)[columns]
+
+    def result_to_csv(self, results, file, concat=False):
+        del concat
+        columns = self.SHAPE_KEYS + [
+            "block_m",
+            "ksplit",
+            "kernelName1",
+            "kernelName2",
+        ]
+        old = self.get_tuned_gemm_list(file, columns)
+        for column in columns:
+            if column not in old.columns:
+                old[column] = ""
+        merged = self.update_tunedf(old, results)
+        self.success = pd.concat([self.success, results], ignore_index=True)
+        merged = merged.astype(str).drop_duplicates(
+            subset=self.SHAPE_KEYS, keep="last"
+        )
+        merged[columns].to_csv(file, index=False)
 
 
 class GroupedFmoeTuner(FmoeTuner):
@@ -7009,6 +7900,23 @@ def _mxfp4_shape_proc(payload, out_q, idx):
     out_q.put((idx, _mxfp4_tune_shape_worker(payload)))
 
 
+def _fhmoe_shape_proc(payload, out_q, idx):
+    """Tune one FHMoE shape in a fresh process on its assigned GPU."""
+    _keys, row, args, gpu = payload
+    try:
+        torch.cuda.set_device(gpu)
+        print(
+            f"[fhmoe] shape token={row['token']} inter={row['inter_dim']} "
+            f"shared_expert_id={row['shared_expert_id']} -> GPU{gpu}",
+            flush=True,
+        )
+        result = FhmoeTuner._tune_one_shape(row, args)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[fhmoe] shape failed on GPU{gpu}: {exc}", flush=True)
+        result = None
+    out_q.put((idx, result))
+
+
 def _run_shapes_isolated(payloads, mp_num, ctx, entry=_mxfp4_shape_proc):
     """Run each payload in its own fresh process, at most ``mp_num`` at a time.
 
@@ -7122,9 +8030,17 @@ if __name__ == "__main__":
         "tflops",
         "bw",
     ]
+    use_fhmoe = "--fhmoe" in sys.argv
     use_grouped = "--grouped-gemm" in sys.argv
     use_mxfp4_flydsl = "--mxfp4-flydsl" in sys.argv
-    if use_grouped:
+    if use_fhmoe:
+        tuner = FhmoeTuner(
+            "fhmoeTuner",
+            FhmoeTuner.SHAPE_KEYS,
+            ["block_m", "ksplit", "kernelName1", "kernelName2"],
+            "heterogeneous MXFP4-routed/MXFP8-shared FlyDSL MoE tuner",
+        )
+    elif use_grouped:
         if get_gfx() != "gfx1250":
             raise SystemExit("--grouped-gemm is only supported on gfx1250")
         tuner = GroupedFmoeTuner(

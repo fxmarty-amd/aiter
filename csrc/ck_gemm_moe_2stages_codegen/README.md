@@ -21,6 +21,40 @@ You can find the results of this tuning in `aiter/configs/tuned_fmoe.csv`, like 
     `cu_num` means the number of compute units, and it is used to distinguish between graphics.
     `run_1stage` indicates whether to run fused 1-stage kernel (1) or 2-stages kernels (0).
 
+### Heterogeneous MoE
+
+`aiter/configs/untuned_fhmoe.csv` records workloads with MXFP4 routed-expert
+weights and a separate MXFP8 shared expert. Tune them with the explicit FHMoE
+mode; omitting `--fhmoe` is rejected because the ordinary tuner would otherwise
+benchmark homogeneous routed weights:
+
+```bash
+HIP_VISIBLE_DEVICES=4,5,6,7 \
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  --fhmoe \
+  -i aiter/configs/untuned_fhmoe.csv \
+  -o /tmp/tuned_fhmoe_candidate.csv \
+  -o2 /tmp/profile_fhmoe.csv \
+  --mp 4 --fhmoe-compile-workers 16 --batch 4 --all
+```
+
+The tuner constructs the routed MXFP4 and shared MXFP8 storage separately,
+routes the final expert id through the shared pointers, rejects candidates that
+do not match the composed routed-plus-shared reference, and ranks the retained
+stage candidates by complete pipeline latency. An existing matching FHMoE row
+is measured as a baseline candidate, so a search does not discard it merely
+because it falls outside the retained stage shortlist. Use a temporary output
+first; after reviewing its profile and winners, copy the selected rows into
+`aiter/configs/tuned_fhmoe.csv`.
+
+Before benchmarking, the tuner deduplicates the candidate set by the actual
+FHMoE compiler specialization and precompiles those kernels in parallel.
+`--fhmoe-compile-workers 0` selects `min(16, 4 * --mp)` workers; use
+`--fhmoe-skip-precompile` only when the required artifacts are already cached.
+
+For a quick plumbing check, `TUNE_MOE_KERNEL_REGEX` can restrict both stages
+to named kernels before running the full candidate sweep.
+
 4. Build tuned kernels and test:
 Test the performance, modify the test instance in `op_tests/test_moe.py` or `python3 op_tests/test_moe_2stage.py` and run it, please wait a few minutes as it will build moe tuned kernels in `aiter/configs/tuned_fmoe.csv` via jit:
 `python3 op_tests/test_moe.py` or `python3 op_tests/test_moe_2stage.py`
@@ -268,4 +302,3 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 - Only G1U1 (gate-up fused) MoE configurations are currently supported for tuning
 - Supported quantization types include: per_Token, per_1x128 (blockscale), per_1x32 (MXFP4, gfx950 only)
 - If you use flag `PREBUILD_KERNELS=1` when you install aiter, it will build moe kernels in tuned csv by default. If you want to use the new result of moe tuning, please remove `build` and `*.so` in `aiter/jit` first, then re-install aiter after finishing tune. This can take a lot of time and is not recommended.
-

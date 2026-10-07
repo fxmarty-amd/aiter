@@ -1037,7 +1037,13 @@ def test_dsv4_i384_fhmoe_capability_follows_csv(
         assert reader.fieldnames is not None
         fieldnames = reader.fieldnames
 
-    row_4096 = dict(rows[-1])
+    row_4096 = dict(
+        next(
+            row
+            for row in rows
+            if row["model_dim"] == "7168" and row["token"] == "2048"
+        )
+    )
     row_4096["token"] = "4096"
     complete_path = tmp_path / "complete.csv"
     with complete_path.open("w", newline="") as config:
@@ -1233,13 +1239,13 @@ def test_dsv4_i384_fhmoe_config_requires_exact_bucket(
     [
         (
             384,
-            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
-            "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
+            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_bnt0_gui_fp8",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_reduce",
         ),
         (
             768,
-            "flydsl_moe1_afp8_wfp4_bf16_t32x128x256_w4_gui_fp8",
-            "flydsl_moe2_afp8_wfp4_bf16_t32x256x256_reduce",
+            "flydsl_moe1_afp8_wfp4_bf16_t64x256x256_w3_bnt0_gui",
+            "flydsl_moe2_afp8_wfp4_bf16_t64x128x256_atomic_persist",
         ),
     ],
 )
@@ -1329,6 +1335,100 @@ def test_dsv4_i384_fhmoe_config_has_true_shapes():
         and int(row["topk"]) == 7
     )
     assert ordinary_m16["kernelName2"].startswith("opus_")
+
+
+def test_mxfp4_mxfp8_swiglu_fhmoe_untuned_shapes_match_tuned_config():
+    import csv
+
+    config_dir = Path(__file__).resolve().parents[1] / "aiter/configs"
+    with (config_dir / "untuned_fhmoe.csv").open(newline="") as f:
+        untuned_reader = csv.DictReader(f)
+        untuned_rows = list(untuned_reader)
+        assert untuned_reader.fieldnames is not None
+        untuned_fields = untuned_reader.fieldnames
+    with (config_dir / "tuned_fhmoe.csv").open(newline="") as f:
+        tuned_rows = list(csv.DictReader(f))
+
+    shape_fields = [
+        "gfx",
+        "cu_num",
+        "token",
+        "model_dim",
+        "inter_dim",
+        "expert",
+        "topk",
+        "shared_expert_id",
+        "act_type",
+        "dtype",
+        "q_dtype_a",
+        "q_dtype_w",
+        "q_type",
+        "use_g1u1",
+        "doweight_stage1",
+        "hidden_pad",
+        "intermediate_pad",
+        "gate_mode",
+    ]
+    assert untuned_fields == shape_fields
+
+    expected_tokens = {
+        "1",
+        "2",
+        "4",
+        "8",
+        "16",
+        "32",
+        "64",
+        "128",
+        "256",
+        "512",
+        "1024",
+        "2048",
+    }
+    assert len(untuned_rows) == 24
+    assert {row["inter_dim"] for row in untuned_rows} == {"384", "768"}
+    assert all(row["model_dim"] == "6144" for row in untuned_rows)
+    assert all(row["shared_expert_id"] == "128" for row in untuned_rows)
+    for inter_dim in ("384", "768"):
+        assert {
+            row["token"] for row in untuned_rows if row["inter_dim"] == inter_dim
+        } == expected_tokens
+
+    tuned_shape_keys = {
+        tuple(row[field] for field in shape_fields)
+        for row in tuned_rows
+        if row["model_dim"] == "6144"
+    }
+    assert {
+        tuple(row[field] for field in shape_fields) for row in untuned_rows
+    } == tuned_shape_keys
+
+
+def test_fhmoe_tuner_enumerates_current_swiglu_configs():
+    import csv
+
+    default_device = torch.get_default_device()
+    try:
+        from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FhmoeTuner
+    finally:
+        torch.set_default_device(default_device)
+
+    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    with config_path.open(newline="") as f:
+        rows = [
+            row
+            for row in csv.DictReader(f)
+            if row["model_dim"] == "6144"
+        ]
+
+    assert len(rows) == 24
+    for row in rows:
+        candidates = FhmoeTuner._candidate_sets(row)
+        block_m = int(row["block_m"])
+        assert block_m in candidates
+        stage1, stage2 = candidates[block_m]
+        assert row["kernelName1"] in stage1
+        assert row["kernelName2"] in stage2
 
 
 def test_fhmoe_aot_manifest_covers_native_i384():
@@ -1604,3 +1704,70 @@ def test_heterogeneous_moe_supports_swiglu(
 
     assert torch.isfinite(actual).all()
     assert _rel_l2(actual, routed + shared) <= 5e-2
+
+
+@pytest.fixture(scope="module", params=[384, 768], ids=lambda value: f"i{value}")
+def swiglu_tuned_case(request):
+    intermediate_size = request.param
+    profile = _Profile(6144, intermediate_size, intermediate_size, 129, 4)
+    weights = _build_weights(
+        profile,
+        interleave=True,
+        native_mxfp8_scales=True,
+    )
+    return profile, weights
+
+
+@pytest.mark.parametrize(
+    "m", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+)
+def test_heterogeneous_moe_swiglu_tuned_token_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+    swiglu_tuned_case,
+    m: int,
+):
+    """Exercise every configured token bucket through normal FHMoE dispatch."""
+    profile, weights = swiglu_tuned_case
+    monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
+    monkeypatch.delenv("AITER_FLYDSL_FORCE_REDUCE", raising=False)
+
+    hidden, routed_weight, routed_ids, all_weight, all_ids = _route_inputs(
+        profile, m, weights.routed_w1.device
+    )
+    kwargs = _common_kwargs(profile, weights.routed_s1, weights.routed_s2)
+    kwargs.update(
+        activation=aiter.ActivationType.Swiglu,
+        shared_w1=weights.shared_w1,
+        shared_w2=weights.shared_w2,
+        shared_w1_scale=weights.shared_s1,
+        shared_w2_scale=weights.shared_s2,
+        shared_expert_id=profile.shared_id,
+    )
+
+    actual = fused_moe(
+        hidden,
+        weights.routed_w1,
+        weights.routed_w2,
+        all_weight,
+        all_ids,
+        **kwargs,
+    )
+    routed = _torch_routed_reference(
+        hidden,
+        routed_weight,
+        routed_ids,
+        weights,
+        profile,
+        activation="swiglu",
+    )
+    shared = _torch_shared_reference(
+        hidden,
+        weights,
+        32,
+        _swiglu_limit(profile),
+        activation="swiglu",
+    )
+
+    assert torch.isfinite(actual).all(), f"non-finite output for M={m}"
+    error = _rel_l2(actual, routed + shared)
+    assert error <= 5e-2, f"M={m} relative L2 error: {error:.3e}"
