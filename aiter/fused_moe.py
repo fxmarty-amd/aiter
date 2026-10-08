@@ -421,6 +421,7 @@ def _moe_sorting_impl(
     dispatch_policy,
     use_opus,
     return_local_topk_ids=False,
+    return_reverse_sorted=False,
     accumulate=True,
     output_aux=False,
     output=None,
@@ -471,22 +472,23 @@ def _moe_sorting_impl(
     else:
         moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     local_topk_ids = torch.empty_like(topk_ids) if return_local_topk_ids else None
-    if return_local_topk_ids:
+    if return_local_topk_ids or return_reverse_sorted:
         # CK sorting does not emit local ids; use Opus so callers do not need a slow
-        # Python-side remap or a hard failure when local expert ids are required.
+        # Python-side remap or reverse-map reconstruction.
         use_opus = True
 
     aux_m_indices = None
     aux_reverse_sorted = None
-    if output_aux:
+    if output_aux or return_reverse_sorted:
         use_opus = True
+        aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+    if output_aux:
         dispatch_policy = (
             0 if _aux_uses_opus(output_aux, block_size, M * topk, num_experts) else 1
         )
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
         )
-        aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
@@ -533,8 +535,12 @@ def _moe_sorting_impl(
     ret = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, moe_buf)
     if output_aux:
         return (*ret, aux_m_indices, aux_reverse_sorted)
+    if return_local_topk_ids and return_reverse_sorted:
+        return (*ret, local_topk_ids, aux_reverse_sorted)
     if return_local_topk_ids:
         return (*ret, local_topk_ids)
+    if return_reverse_sorted:
+        return (*ret, aux_reverse_sorted)
     return ret
 
 
@@ -606,6 +612,7 @@ def moe_sorting(
     num_local_tokens=None,
     dispatch_policy=0,
     return_local_topk_ids=False,
+    return_reverse_sorted=False,
     accumulate=True,
     flat=False,
     output_aux=False,
@@ -615,6 +622,7 @@ def moe_sorting(
         not _USE_CK_MOE_SORTING
         and _USE_FLYDSL_MOE_SORTING
         and not return_local_topk_ids
+        and not return_reverse_sorted
         and not flat
         and not output_aux
         and dispatch_policy == 0
@@ -651,6 +659,7 @@ def moe_sorting(
             dispatch_policy,
             use_opus=not _USE_CK_MOE_SORTING,
             return_local_topk_ids=return_local_topk_ids,
+            return_reverse_sorted=return_reverse_sorted,
             accumulate=accumulate,
             output_aux=output_aux,
             output=output,
@@ -1190,6 +1199,14 @@ def _fused_moe_impl(
     elif _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
 
+    requested_q_dtype_a = (
+        quant_dtype_a if quant_dtype_a is not None else _q_dtype_a
+    )
+    if requested_q_dtype_a in (dtypes.fp4x2, dtypes.fp8):
+        assert q_dtype_a == requested_q_dtype_a, (
+            "fused_moe must honor the requested MXFP4/MXFP8 activation dtype"
+        )
+
     grouped_a8w4_out = None
     from aiter.ops.flydsl.grouped_moe_gfx1250 import grouped_gemm_gfx1250_a8w4
 
@@ -1426,6 +1443,22 @@ def _fused_moe_impl(
         "gfx942",
         "gfx950",
     ), f"FLAT fmoe asm kernels are gfx942/gfx950-only; refusing to launch on {get_gfx()}. "
+    use_mxfp8_route_quant = (
+        not metadata.run_1stage
+        and not metadata.flat
+        and quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp4x2
+        and global_E == 129
+        and model_dim == 6144
+        and inter_dim in (384, 768)
+        and topk == 5
+        and M <= int(os.environ.get("AITER_MXFP8_ROUTE_QUANT_MAX_M", "128"))
+        and gate_mode == GateMode.INTERLEAVE
+        and expert_mask is None
+        and not _USE_CK_MOE_SORTING
+        and os.environ.get("AITER_MXFP8_ROUTE_QUANT", "1") == "1"
+    )
 
     sort_m_indices = None
     sort_reverse_sorted = None
@@ -1477,11 +1510,22 @@ def _fused_moe_impl(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             return_local_topk_ids=need_local_topk_ids,
+            return_reverse_sorted=use_mxfp8_route_quant,
             accumulate=not stage2_uses_route_reduce(metadata.stage2),
             flat=metadata.flat,
             output=None if metadata.flat else output,
         )
-        if need_local_topk_ids:
+        if use_mxfp8_route_quant:
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_reverse_sorted,
+            ) = sorting_ret
+            local_topk_ids = None
+        elif need_local_topk_ids:
             (
                 sorted_ids,
                 sorted_weights,
@@ -4164,6 +4208,16 @@ def fused_moe_2stages(
                 num_valid_ids=num_valid_ids,
                 token_num=token_num,
                 cols=model_dim,
+            )
+        elif reverse_sorted is not None:
+            from aiter.ops.quant import fused_dynamic_mxfp8_quant_moe_route
+
+            a1, a1_scale = fused_dynamic_mxfp8_quant_moe_route(
+                hidden_states,
+                sorted_ids=sorted_ids,
+                reverse_sorted=reverse_sorted,
+                token_num=token_num,
+                topk=topk,
             )
         else:
             # stage1 input is not topk-replicated, so M==token_num and the HIP
