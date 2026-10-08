@@ -5,7 +5,9 @@ import argparse
 import functools
 import math
 import os
+import random
 import re
+import statistics
 import sys
 import tempfile
 from argparse import ArgumentTypeError
@@ -508,7 +510,13 @@ class FmoeTuner(TunerCommon):
             "--fhmoe-top-candidates",
             type=int,
             default=3,
-            help="Retain this many stage candidates per block_m for FHMoE e2e reranking.",
+            help="Remeasure this many complete FHMoE pairs per block_m on two route seeds.",
+        )
+        self.parser.add_argument(
+            "--fhmoe-search-iters",
+            type=int,
+            default=3,
+            help="Cold HIP graph samples per pair in the exhaustive FHMoE search.",
         )
         self.parser.add_argument(
             "--fhmoe-skip-precompile",
@@ -6196,10 +6204,9 @@ class FmoeTuner(TunerCommon):
 class FhmoeTuner(FmoeTuner):
     """Tune the real MXFP4-routed/MXFP8-shared FlyDSL pipeline.
 
-    Stage candidates are first ranked while paired with a known-correct anchor
-    for the same sorting block size. The fastest candidates from each side are
-    then reranked as complete pipelines. Every timing therefore includes the
-    heterogeneous shared-expert branch; the final choice is always end-to-end.
+    Every compatible stage pair is measured as a complete cold-weight HIP
+    graph. Finalists are remeasured on two routing seeds in alternating order.
+    Validation and timing use the same nonzero weights and routing tensors.
     """
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
@@ -6238,7 +6245,7 @@ class FhmoeTuner(FmoeTuner):
         return tensor
 
     @classmethod
-    def _make_data(cls, row, device="cuda"):
+    def _make_data(cls, row, device="cuda", seed=0):
         token = int(row["token"])
         model_dim = int(row["model_dim"])
         inter_dim = int(row["inter_dim"])
@@ -6255,7 +6262,7 @@ class FhmoeTuner(FmoeTuner):
             raise ValueError(f"invalid routed top-k {routed_topk} for {shared_id} experts")
 
         generator = torch.Generator(device=device).manual_seed(
-            1701 + token + 17 * inter_dim
+            1701 + token + 17 * inter_dim + seed
         )
         hidden = torch.randn(
             (token, model_dim),
@@ -6264,10 +6271,7 @@ class FhmoeTuner(FmoeTuner):
             generator=generator,
         )
 
-        # Match the established FHMoE correctness oracle: populate every expert
-        # reachable by the synthetic routing and leave the remaining storage at
-        # exact zero. This keeps setup bounded even for E=385 while exercising
-        # the real heterogeneous addressing and shared-expert branch.
+        # Initialize every expert used by either validation or timing.
         routed_w1_u8 = torch.zeros(
             (shared_id, 2 * inter_dim, model_dim // 2),
             dtype=torch.uint8,
@@ -6290,8 +6294,8 @@ class FhmoeTuner(FmoeTuner):
             dtype=torch.uint8,
             device=device,
         )
-        for expert_id in range(routed_topk):
-            scale = 0.02 + 0.005 * expert_id
+        for expert_id in range(shared_id):
+            scale = 0.02 + 0.005 * (expert_id % 4)
             dense_w1 = (
                 torch.randn(
                     (1, 2 * inter_dim, model_dim),
@@ -6402,12 +6406,8 @@ class FhmoeTuner(FmoeTuner):
             ).view(1, model_dim, inter_dim // 32)
             % 4
         ).view(dtypes.fp8_e8m0)
-        shared_w1 = cls._mark_shuffled(
-            shuffle_weight_a16w4(shared_w1_raw, 16, True)
-        )
-        shared_w2 = cls._mark_shuffled(
-            shuffle_weight_a16w4(shared_w2_raw, 16, False)
-        )
+        shared_w1 = cls._mark_shuffled(shuffle_weight_a16w4(shared_w1_raw, 16, True))
+        shared_w2 = cls._mark_shuffled(shuffle_weight_a16w4(shared_w2_raw, 16, False))
         shared_s1 = shuffle_scale_a16w4(
             shared_s1_raw.view(-1, shared_s1_raw.shape[-1]), 1, True
         )
@@ -6415,28 +6415,18 @@ class FhmoeTuner(FmoeTuner):
             shared_s2_raw.view(-1, shared_s2_raw.shape[-1]), 1, False
         )
 
-        token_idx = torch.arange(token, dtype=dtypes.i32, device=device)[:, None]
-        slot_idx = torch.arange(routed_topk, dtype=dtypes.i32, device=device)[None, :]
-        # Keep the validation distribution identical to the established FHMoE
-        # correctness oracle. Candidate timing still exercises the full tensor
-        # footprint; routing-distribution sweeps can be added independently.
-        routed_ids = (token_idx + slot_idx) % routed_topk
-        shared_ids = torch.full(
-            (token, 1), shared_id, dtype=dtypes.i32, device=device
-        )
-        topk_ids = torch.cat((routed_ids, shared_ids), dim=1)
-        routed_weights = torch.arange(
-            1,
-            routed_topk + 1,
-            dtype=torch.float32,
+        scores = torch.randn(
+            (token, shared_id),
             device=device,
-        ).repeat(token, 1)
-        routed_weights = (
-            routed_weights / routed_weights.sum(dim=1, keepdim=True) * 2.5
-        )
-        shared_weights = torch.ones(
-            (token, 1), dtype=torch.float32, device=device
-        )
+            generator=generator,
+            dtype=torch.float32,
+        ).sigmoid()
+        routed_weights, routed_ids = scores.topk(routed_topk, dim=-1)
+        routed_ids = routed_ids.to(dtypes.i32)
+        routed_weights = routed_weights / routed_weights.sum(dim=-1, keepdim=True) * 2.0
+        shared_ids = torch.full((token, 1), shared_id, dtype=dtypes.i32, device=device)
+        topk_ids = torch.cat((routed_ids, shared_ids), dim=1)
+        shared_weights = torch.ones((token, 1), dtype=torch.float32, device=device)
         routing = torch.cat((routed_weights, shared_weights), dim=1)
 
         return {
@@ -6455,10 +6445,10 @@ class FhmoeTuner(FmoeTuner):
             "routed_w2": routed_w2,
             "routed_s1": routed_s1,
             "routed_s2": routed_s2,
-            "routed_w1_raw": routed_w1_raw[:routed_topk],
-            "routed_w2_raw": routed_w2_raw[:routed_topk],
-            "routed_s1_raw": routed_s1_raw[:routed_topk],
-            "routed_s2_raw": routed_s2_raw[:routed_topk],
+            "routed_w1_raw": routed_w1_raw,
+            "routed_w2_raw": routed_w2_raw,
+            "routed_s1_raw": routed_s1_raw,
+            "routed_s2_raw": routed_s2_raw,
             "shared_w1_raw": shared_w1_raw,
             "shared_w2_raw": shared_w2_raw,
             "shared_s1_raw": shared_s1_raw,
@@ -6518,7 +6508,7 @@ class FhmoeTuner(FmoeTuner):
             dtype=torch.float32,
             device=hidden.device,
         )
-        for expert_id in range(routed_ids.shape[1]):
+        for expert_id in routed_ids.unique().tolist():
             mask = routed_ids == expert_id
             gate_up = F.linear(expanded[mask], routed_w1[expert_id])
             gate, up = gate_up.chunk(2, dim=-1)
@@ -6541,35 +6531,6 @@ class FhmoeTuner(FmoeTuner):
         shared_inter = cls._mxfp8_quant_dequant(shared_inter.float())
         shared = F.linear(shared_inter, shared_w2[0]) * data["shared_weights"]
         return routed + shared
-
-    @staticmethod
-    def _distributed_timing_data(row, data):
-        """Reuse validated tensors while spreading routed work over all experts."""
-        timing_data = dict(data)
-        token = int(row["token"])
-        routed_topk = int(row["topk"]) - 1
-        shared_id = int(row["shared_expert_id"])
-        token_idx = torch.arange(
-            token, dtype=dtypes.i32, device=data["hidden"].device
-        )[:, None]
-        slot_idx = torch.arange(
-            routed_topk, dtype=dtypes.i32, device=data["hidden"].device
-        )[None, :]
-        routed_ids = (token_idx * routed_topk + slot_idx * 17) % shared_id
-        timing_data["routed_ids"] = routed_ids
-        timing_data["topk_ids"] = torch.cat(
-            (
-                routed_ids,
-                torch.full(
-                    (token, 1),
-                    shared_id,
-                    dtype=dtypes.i32,
-                    device=data["hidden"].device,
-                ),
-            ),
-            dim=1,
-        )
-        return timing_data
 
     @staticmethod
     def _candidate_row(row, block_m, kernel1, kernel2):
@@ -6801,141 +6762,194 @@ class FhmoeTuner(FmoeTuner):
         output_f32 = output.float().flatten()
         reference_f32 = reference.float().flatten()
         denominator = (
-            output_f32.square() + reference_f32.square()
-        ).sum().clamp_min(1e-24)
+            (output_f32.square() + reference_f32.square()).sum().clamp_min(1e-24)
+        )
         cosine_distance = float(
             1 - 2 * (output_f32 * reference_f32).sum() / denominator
         )
-        if (
-            not math.isfinite(cosine_distance)
-            or cosine_distance > float(args.errRatio)
-        ):
+        if not math.isfinite(cosine_distance) or cosine_distance > float(args.errRatio):
             raise RuntimeError(
                 f"cosine distance {cosine_distance:.6g} exceeds {args.errRatio}"
             )
-        from aiter.test_common import run_perftest
-
-        _, us = run_perftest(
-            lambda: cls._run_pipeline(row, timing_data, config_path),
-            num_warmup=int(args.warmup),
-            num_iters=int(args.iters),
-            use_cuda_event=True,
+        # Events are graph nodes: neither Python dispatch nor graph launch is
+        # timed. Flush before each replay to avoid implicit closure/argument
+        # rotation and exclude the flush from the measured interval.
+        flush = timing_data["cache_flush"]
+        for _ in range(int(args.warmup)):
+            cls._run_pipeline(row, timing_data, config_path)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        begin = torch.cuda.Event(enable_timing=True, external=True)
+        end = torch.cuda.Event(enable_timing=True, external=True)
+        with torch.cuda.graph(graph):
+            flush.add_(1)
+            begin.record()
+            graph_output = cls._run_pipeline(row, timing_data, config_path)
+            end.record()
+        graph.replay()
+        torch.cuda.synchronize()
+        # Check the captured execution as well, including alternate epilogues.
+        graph_f32 = graph_output.float().flatten()
+        graph_denominator = (
+            (graph_f32.square() + reference_f32.square()).sum().clamp_min(1e-24)
         )
-        return float(us), cosine_distance
+        graph_error = float(
+            1 - 2 * (graph_f32 * reference_f32).sum() / graph_denominator
+        )
+        if not math.isfinite(graph_error) or graph_error > float(args.errRatio):
+            raise RuntimeError(f"graph cosine distance {graph_error:.6g}")
+        samples = []
+        for _ in range(int(args.iters)):
+            graph.replay()
+            torch.cuda.synchronize()
+            samples.append(begin.elapsed_time(end) * 1000)
+        return float(statistics.median(samples)), max(cosine_distance, graph_error)
 
     @classmethod
     def _tune_one_shape(cls, row, args):
-        validation_data = cls._make_data(row)
-        timing_data = cls._distributed_timing_data(row, validation_data)
-        reference = cls._composed_reference(row, validation_data)
+        if min(args.iters, args.fhmoe_search_iters, args.fhmoe_top_candidates) < 1:
+            raise ValueError("FHMoE iteration and finalist counts must be positive")
+        data = cls._make_data(row)
+        data["cache_flush"] = torch.zeros(
+            512 * 1024 * 1024, dtype=torch.uint8, device=data["hidden"].device
+        )
+        reference = cls._composed_reference(row, data)
         spaces = cls._candidate_sets(row)
-        top_n = max(1, int(args.fhmoe_top_candidates))
         profile = []
-        best = None
-        measured_cache = {}
+        measured = {}
+        existing = cls._existing_candidate(row)
+        candidates = {
+            (block_m, kernel1, kernel2)
+            for block_m, (stage1, stage2) in spaces.items()
+            for kernel1 in stage1
+            for kernel2 in stage2
+        }
+        if existing is not None:
+            candidates.add(
+                (
+                    int(existing["block_m"]),
+                    existing["kernelName1"],
+                    existing["kernelName2"],
+                )
+            )
+        candidates = sorted(candidates)
+        random.Random(1701).shuffle(candidates)
+        search_args = argparse.Namespace(**vars(args))
+        search_args.iters = int(args.fhmoe_search_iters)
+        search_args.warmup = min(int(args.warmup), 1)
         with tempfile.TemporaryDirectory(prefix="aiter_fhmoe_tune_") as tmpdir:
             config_path = os.path.join(tmpdir, "candidate.csv")
 
-            def measure(block_m, kernel1, kernel2):
-                nonlocal best
-                cache_key = (block_m, kernel1, kernel2)
-                if cache_key not in measured_cache:
-                    candidate = cls._candidate_row(
-                        row, block_m, kernel1, kernel2
-                    )
-                    us, err = cls._measure_candidate(
-                        row,
-                        validation_data,
-                        timing_data,
-                        reference,
-                        candidate,
-                        args,
-                        config_path,
-                    )
-                    measured_cache[cache_key] = {
-                        **candidate,
-                        "us": us,
-                        "err": err,
-                    }
-                    profile.append(measured_cache[cache_key])
-                    if best is None or measured_cache[cache_key]["us"] < best["us"]:
-                        best = measured_cache[cache_key]
-                return measured_cache[cache_key]
+            def measure(key, tensors, expected, measurement_args, phase, seed):
+                candidate = cls._candidate_row(row, *key)
+                us, err = cls._measure_candidate(
+                    row,
+                    tensors,
+                    tensors,
+                    expected,
+                    candidate,
+                    measurement_args,
+                    config_path,
+                )
+                result = {
+                    **candidate,
+                    "us": us,
+                    "err": err,
+                    "phase": phase,
+                    "seed": seed,
+                }
+                profile.append(result)
+                return result
 
-            existing = cls._existing_candidate(row)
-            if existing is not None:
+            for index, key in enumerate(candidates):
                 try:
-                    best = measure(
-                        int(existing["block_m"]),
-                        existing["kernelName1"],
-                        existing["kernelName2"],
+                    measured[key] = measure(
+                        key, data, reference, search_args, "search", 0
                     )
                 except Exception as exc:  # noqa: BLE001
                     if args.verbose:
-                        print(f"[fhmoe] existing config failed validation: {exc}")
+                        print(f"[fhmoe] pair failed: {key}: {exc}", flush=True)
+                if (index + 1) % 100 == 0:
+                    print(
+                        f"[fhmoe] token={row['token']} pairs "
+                        f"{index + 1}/{len(candidates)}, valid={len(measured)}",
+                        flush=True,
+                    )
+            if not measured:
+                raise RuntimeError(f"no valid heterogeneous FlyDSL candidate for {row}")
 
-            for block_m, (stage1, stage2) in spaces.items():
-                anchor = None
-                for kernel1 in stage1:
-                    for kernel2 in stage2:
+            # The shortlist is formed from measured complete pairs, never from
+            # isolated stages or stages paired with an arbitrary anchor.
+            finalists = set()
+            for block_m in {key[0] for key in measured}:
+                ranked = sorted(
+                    (key for key in measured if key[0] == block_m),
+                    key=lambda key: measured[key]["us"],
+                )
+                finalists.update(ranked[: int(args.fhmoe_top_candidates)])
+            if existing is not None:
+                key = (
+                    int(existing["block_m"]),
+                    existing["kernelName1"],
+                    existing["kernelName2"],
+                )
+                if key in measured:
+                    finalists.add(key)
+            scores = {key: [] for key in finalists}
+            errors = {key: [] for key in finalists}
+            for seed in (0, 8000):
+                if seed:
+                    # Keep all weights identical; vary input and route tensors.
+                    generator = torch.Generator(device=data["hidden"].device)
+                    generator.manual_seed(seed + int(row["token"]))
+                    data["hidden"].normal_(generator=generator)
+                    weights, ids = (
+                        torch.randn(
+                            (int(row["token"]), int(row["shared_expert_id"])),
+                            device=data["hidden"].device,
+                            generator=generator,
+                        )
+                        .sigmoid()
+                        .topk(int(row["topk"]) - 1, dim=-1)
+                    )
+                    weights = weights / weights.sum(dim=-1, keepdim=True) * 2.0
+                    data["routed_ids"] = ids.to(dtypes.i32)
+                    data["routed_weights"] = weights
+                    data["topk_ids"][:, :-1].copy_(ids)
+                    data["topk_weights"][:, :-1].copy_(weights)
+                    reference = cls._composed_reference(row, data)
+                for repeat in range(2):
+                    order = sorted(finalists, reverse=bool(repeat))
+                    for key in order:
                         try:
-                            measure(block_m, kernel1, kernel2)
-                            anchor = (kernel1, kernel2)
-                            break
+                            result = measure(key, data, reference, args, "final", seed)
+                            scores[key].append(result["us"])
+                            errors[key].append(result["err"])
                         except Exception as exc:  # noqa: BLE001
                             if args.verbose:
-                                print(f"[fhmoe] anchor failed: {kernel1}/{kernel2}: {exc}")
-                    if anchor is not None:
-                        break
-                if anchor is None:
-                    continue
-
-                anchor1, anchor2 = anchor
-                ranked1 = []
-                for kernel1 in stage1:
-                    try:
-                        measured = measure(block_m, kernel1, anchor2)
-                    except Exception as exc:  # noqa: BLE001
-                        if args.verbose:
-                            print(f"[fhmoe] stage1 failed: {kernel1}: {exc}")
-                        continue
-                    ranked1.append((measured["us"], kernel1))
-
-                ranked2 = []
-                for kernel2 in stage2:
-                    try:
-                        measured = measure(block_m, anchor1, kernel2)
-                    except Exception as exc:  # noqa: BLE001
-                        if args.verbose:
-                            print(f"[fhmoe] stage2 failed: {kernel2}: {exc}")
-                        continue
-                    ranked2.append((measured["us"], kernel2))
-
-                for _, kernel1 in sorted(ranked1)[:top_n]:
-                    for _, kernel2 in sorted(ranked2)[:top_n]:
-                        try:
-                            measured = measure(block_m, kernel1, kernel2)
-                        except Exception as exc:  # noqa: BLE001
-                            if args.verbose:
-                                print(f"[fhmoe] pair failed: {kernel1}/{kernel2}: {exc}")
-                            continue
+                                print(
+                                    f"[fhmoe] finalist failed: {key}: {exc}", flush=True
+                                )
+            valid = [key for key in finalists if len(scores[key]) == 4]
+            if not valid:
+                raise RuntimeError("no FHMoE finalist passed both routing seeds")
+            winner = min(valid, key=lambda key: statistics.mean(scores[key]))
+            best = {
+                **cls._candidate_row(row, *winner),
+                "us": statistics.mean(scores[winner]),
+                "err": max(errors[winner]),
+            }
             if args.profile_file and profile:
                 import fcntl
 
-                profile_df = pd.DataFrame(profile)
                 with open(args.profile_file, "a+") as profile_output:
                     fcntl.flock(profile_output, fcntl.LOCK_EX)
                     profile_output.seek(0, os.SEEK_END)
-                    profile_df.to_csv(
+                    pd.DataFrame(profile).to_csv(
                         profile_output,
                         index=False,
                         header=profile_output.tell() == 0,
                     )
-        if best is None:
-            raise RuntimeError(
-                "no valid heterogeneous FlyDSL candidate for "
-                + ", ".join(f"{key}={row[key]}" for key in cls.SHAPE_KEYS)
-            )
         print(
             f"[fhmoe] token={row['token']} inter={row['inter_dim']} "
             f"best={best['kernelName1']} + {best['kernelName2']} "

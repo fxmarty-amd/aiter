@@ -29,7 +29,7 @@ mode; omitting `--fhmoe` is rejected because the ordinary tuner would otherwise
 benchmark homogeneous routed weights:
 
 ```bash
-HIP_VISIBLE_DEVICES=4,5,6,7 \
+HIP_VISIBLE_DEVICES=0,1,2,3 \
 python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
   --fhmoe \
   -i aiter/configs/untuned_fhmoe.csv \
@@ -38,13 +38,26 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
   --mp 4 --fhmoe-compile-workers 16 --batch 4 --all
 ```
 
-The tuner constructs the routed MXFP4 and shared MXFP8 storage separately,
-routes the final expert id through the shared pointers, rejects candidates that
-do not match the composed routed-plus-shared reference, and ranks the retained
-stage candidates by complete pipeline latency. An existing matching FHMoE row
-is measured as a baseline candidate, so a search does not discard it merely
-because it falls outside the retained stage shortlist. Use a temporary output
-first; after reviewing its profile and winners, copy the selected rows into
+The tuner initializes every routed expert with nonzero MXFP4 weights and uses
+seeded sigmoid/top-k routing across all experts. Candidate correctness and
+timing use the same tensors and routes, including the MXFP8 shared expert.
+Each sample replays a HIP graph with a 512 MiB cache flush before its timing
+events. The flush, CPU dispatch, and graph launch are excluded from timing;
+argument rotation is not needed and captured tensors are not silently reused
+as a warm-cache substitute.
+
+All compatible stage-1/stage-2 pairs are measured as complete pipelines.
+`--fhmoe-search-iters` controls the initial samples per pair (default 3).
+`--fhmoe-top-candidates` now selects complete pairs per block size for longer
+reranking (default 3), rather than pruning stages against an arbitrary anchor.
+Finalists are validated and timed on two routing/input seeds in forward and
+reverse order, using `--iters` samples. The existing matching row is retained
+as a finalist when valid. The profile CSV records the search/final phase and
+seed. Full pair search is more expensive than the former anchor-based search.
+
+Use power-of-two token counts in the input CSV. Runtime token-tier dispatch
+is unchanged. Write candidates to a temporary output first; review the profile
+and model validation before copying selected rows into
 `aiter/configs/tuned_fhmoe.csv`.
 
 Before benchmarking, the tuner deduplicates the candidate set by the actual

@@ -1771,3 +1771,88 @@ def test_heterogeneous_moe_swiglu_tuned_token_buckets(
     assert torch.isfinite(actual).all(), f"non-finite output for M={m}"
     error = _rel_l2(actual, routed + shared)
     assert error <= 5e-2, f"M={m} relative L2 error: {error:.3e}"
+
+
+def test_fhmoe_tuner_finds_pair_that_loses_with_anchor(monkeypatch):
+    """Stage interactions must not hide the best complete pair from the search."""
+    from argparse import Namespace
+
+    from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FhmoeTuner
+
+    costs = {("a0", "b0"): 5, ("a1", "b0"): 10, ("a0", "b1"): 10, ("a1", "b1"): 1}
+    observed = []
+
+    class Tuner(FhmoeTuner):
+        @classmethod
+        def _make_data(cls, row):
+            return {
+                "hidden": torch.zeros((8, 8), device="cpu"),
+                "topk_ids": torch.zeros((8, 2), device="cpu", dtype=torch.int32),
+                "topk_weights": torch.ones((8, 2), device="cpu"),
+            }
+
+        @classmethod
+        def _composed_reference(cls, row, data):
+            return None
+
+        @staticmethod
+        def _candidate_sets(row):
+            return {16: (["a0", "a1"], ["b0", "b1"])}
+
+        @classmethod
+        def _existing_candidate(cls, row):
+            return None
+
+        @classmethod
+        def _measure_candidate(
+            cls, row, validation, timing, reference, candidate, args, config_path
+        ):
+            assert validation is timing
+            key = candidate["kernelName1"], candidate["kernelName2"]
+            observed.append(key)
+            return costs[key], 0.0
+
+    zeros = torch.zeros
+
+    def small_flush(*args, **kwargs):
+        if args == (512 * 1024 * 1024,):
+            return None
+        return zeros(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", small_flush)
+    row = dict.fromkeys(FhmoeTuner.SHAPE_KEYS, 0)
+    row.update(token=8, shared_expert_id=2, topk=2)
+    args = Namespace(
+        iters=2,
+        warmup=1,
+        fhmoe_search_iters=1,
+        fhmoe_top_candidates=1,
+        verbose=False,
+        profile_file="",
+    )
+    result = Tuner._tune_one_shape(row, args)
+    assert set(observed) == set(costs)
+    assert (result["kernelName1"], result["kernelName2"]) == ("a1", "b1")
+    assert observed.count(("a1", "b1")) == 5  # Search plus two rounds per seed.
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires ROCm")
+def test_fhmoe_tuner_populates_experts_beyond_first_topk():
+    """Validate and time nonzero weights with routes beyond the first top-k ids."""
+    from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import FhmoeTuner
+
+    row = {
+        "token": 32,
+        "model_dim": 256,
+        "inter_dim": 256,
+        "expert": 9,
+        "topk": 3,
+        "shared_expert_id": 8,
+    }
+    data = FhmoeTuner._make_data(row)
+    for key in ("routed_w1_raw", "routed_w2_raw"):
+        raw = data[key].view(torch.uint8).reshape(8, -1)
+        assert raw.any(dim=1).all()
+    assert data["routed_ids"].unique().numel() > 2
+    torch.testing.assert_close(data["topk_ids"][:, :-1], data["routed_ids"])
+    torch.testing.assert_close(data["topk_weights"][:, :-1], data["routed_weights"])
