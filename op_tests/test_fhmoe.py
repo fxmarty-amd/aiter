@@ -1234,59 +1234,33 @@ def test_dsv4_i384_fhmoe_config_requires_exact_bucket(
         )
 
 
-@pytest.mark.parametrize(
-    ("intermediate_size", "expected_stage1", "expected_stage2"),
-    [
-        (
-            384,
-            "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_bnt0_gui_fp8",
-            "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_reduce",
-        ),
-        (
-            768,
-            "flydsl_moe1_afp8_wfp4_bf16_t64x256x256_w3_bnt0_gui",
-            "flydsl_moe2_afp8_wfp4_bf16_t64x128x256_atomic_persist",
-        ),
-    ],
-)
-def test_mxfp4_mxfp8_moe_config_falls_back_to_largest_tuned_tier(
-    monkeypatch: pytest.MonkeyPatch,
-    intermediate_size: int,
-    expected_stage1: str,
-    expected_stage2: str,
+@pytest.mark.parametrize("intermediate_size", (384, 768))
+def test_mxfp4_mxfp8_moe_config_requires_exact_tier(
+    monkeypatch: pytest.MonkeyPatch, intermediate_size: int
 ):
-    import importlib
-
-    fused_moe_module = importlib.import_module("aiter.fused_moe")
+    fm = _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
     config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
-    monkeypatch.setattr(fused_moe_module, "get_cu_num", lambda: 256)
-    monkeypatch.setattr(fused_moe_module, "get_gfx_runtime", lambda: "gfx950")
-    fused_moe_module.get_2stage_cfgs.cache_clear()
-    fused_moe_module.cfg_2stages_by_file.clear()
-
-    metadata = fused_moe_module.get_2stage_cfgs(
-        fused_moe_module.get_padded_M(4097),
-        6144,
-        intermediate_size,
-        129,
-        5,
-        torch.bfloat16,
-        dtypes.fp8,
-        dtypes.fp4x2,
-        aiter.QuantType.per_1x32,
-        True,
-        aiter.ActivationType.Swiglu,
-        False,
-        0,
-        0,
-        True,
-        GateMode.INTERLEAVE,
-        swiglu_limit=7.0,
-        config_file=str(config_path),
-    )
-
-    assert metadata.stage1.keywords["kernelName"] == expected_stage1
-    assert metadata.stage2.keywords["kernelName"] == expected_stage2
+    with pytest.raises(NotImplementedError, match="exact tuned config row"):
+        fm.get_2stage_cfgs(
+            fm.get_padded_M(4097),
+            6144,
+            intermediate_size,
+            129,
+            5,
+            torch.bfloat16,
+            dtypes.fp8,
+            dtypes.fp4x2,
+            aiter.QuantType.per_1x32,
+            True,
+            aiter.ActivationType.Swiglu,
+            False,
+            0,
+            0,
+            True,
+            GateMode.INTERLEAVE,
+            swiglu_limit=7.0,
+            config_file=str(config_path),
+        )
 
 
 def test_dsv4_i384_fhmoe_config_has_true_shapes():
@@ -1719,7 +1693,7 @@ def swiglu_tuned_case(request):
 
 
 @pytest.mark.parametrize(
-    "m", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048]
+    "m", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 )
 def test_heterogeneous_moe_swiglu_tuned_token_buckets(
     monkeypatch: pytest.MonkeyPatch,
@@ -1856,3 +1830,66 @@ def test_fhmoe_tuner_populates_experts_beyond_first_topk():
     assert data["routed_ids"].unique().numel() > 2
     torch.testing.assert_close(data["topk_ids"][:, :-1], data["routed_ids"])
     torch.testing.assert_close(data["topk_weights"][:, :-1], data["routed_weights"])
+
+
+@pytest.mark.parametrize("intermediate_size", (384, 768))
+@pytest.mark.parametrize(
+    "m,expected",
+    [
+        (1, True),
+        (1024, True),
+        (1025, False),
+        (2048, False),
+        (2049, False),
+        (4096, False),
+        (0, False),
+        (True, False),
+    ],
+)
+def test_minimax_fhmoe_capability_limit(monkeypatch, intermediate_size, m, expected):
+    from aiter.fhmoe import supports_mxfp4_mxfp8_swiglu_fhmoe
+
+    _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
+    assert supports_mxfp4_mxfp8_swiglu_fhmoe(m, intermediate_size) is expected
+
+
+@pytest.mark.parametrize("intermediate_size", (384, 768))
+def test_minimax_fhmoe_capability_rejects_missing_interior_tier(
+    monkeypatch, tmp_path, intermediate_size
+):
+    import csv
+
+    from aiter import fhmoe
+
+    _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
+    source = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
+    with source.open() as config:
+        reader = csv.DictReader(config)
+        fields = reader.fieldnames
+        rows = list(reader)
+    gap = tmp_path / "gap.csv"
+    with gap.open("w", newline="") as config:
+        writer = csv.DictWriter(config, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(
+            row
+            for row in rows
+            if not (
+                row["model_dim"] == "6144"
+                and row["inter_dim"] == str(intermediate_size)
+                and row["token"] == "16"
+            )
+        )
+    monkeypatch.setattr(fhmoe, "_dsv4_i384_fhmoe_config_file", lambda: str(gap))
+    assert fhmoe.supports_mxfp4_mxfp8_swiglu_fhmoe(8, intermediate_size)
+    assert not fhmoe.supports_mxfp4_mxfp8_swiglu_fhmoe(32, intermediate_size)
+    assert not fhmoe.supports_mxfp4_mxfp8_swiglu_fhmoe(1024, intermediate_size)
+
+
+@pytest.mark.parametrize("bypass", ("1", "2", "invalid"))
+def test_minimax_fhmoe_capability_rejects_config_bypass(monkeypatch, bypass):
+    from aiter.fhmoe import supports_mxfp4_mxfp8_swiglu_fhmoe
+
+    _mock_dsv4_i384_fhmoe_metadata(monkeypatch)
+    monkeypatch.setenv("AITER_BYPASS_TUNE_CONFIG", bypass)
+    assert not supports_mxfp4_mxfp8_swiglu_fhmoe(1, 768)

@@ -402,20 +402,13 @@ def supports_dsv4_i384_fhmoe(max_tokens: int) -> bool:
 
 
 @functools.cache
-def supports_mxfp4_mxfp8_swiglu_fhmoe(
+def _supports_mxfp4_mxfp8_swiglu_fhmoe_config(
     max_tokens: int,
     intermediate_size: int,
+    config_file: str,
 ) -> bool:
-    """Return whether AITER can dispatch heterogeneous MXFP4/MXFP8 MoE with SwiGLU."""
-    if type(max_tokens) is not int or max_tokens <= 0:
-        return False
-    if intermediate_size not in (384, 768):
-        return False
-
     try:
         from aiter.fused_moe import get_2stage_cfgs, get_padded_M
-
-        config_file = _dsv4_i384_fhmoe_config_file()
 
         required_tokens = {
             get_padded_M(1 << exponent) for exponent in range(max_tokens.bit_length())
@@ -453,6 +446,26 @@ def supports_mxfp4_mxfp8_swiglu_fhmoe(
     ):
         return False
     return True
+
+
+def supports_mxfp4_mxfp8_swiglu_fhmoe(
+    max_tokens: int,
+    intermediate_size: int,
+) -> bool:
+    """Return whether the dedicated CSV continuously covers M through 1024."""
+    if type(max_tokens) is not int or not 0 < max_tokens <= 1024:
+        return False
+    if intermediate_size not in (384, 768):
+        return False
+    try:
+        if int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0")) != 0:
+            return False
+        config_file = _dsv4_i384_fhmoe_config_file()
+    except (ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return _supports_mxfp4_mxfp8_swiglu_fhmoe_config(
+        max_tokens, intermediate_size, config_file
+    )
 
 
 def _is_dsv4_i384_fhmoe_contract(

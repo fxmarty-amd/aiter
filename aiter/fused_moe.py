@@ -3118,44 +3118,11 @@ def get_2stage_cfgs(
         if not c2s:
             return None
         primary, fallback = c2s
-        fallback_tier_used = None
         lookup_keys = keys[:7] + (str(activation),) + keys[8:]
         result = primary.get(lookup_keys, None)
         if result is None and config_file is None:
             result = fallback.get(keys_disabled, None)
-        # Dedicated FHMoE tables have no generic fallback map. For the
-        # MXFP8-activation/MXFP4-weight MoE contract, reuse the nearest smaller
-        # token-tier row; it is valid for the larger M but is not tuned for it.
-        allow_dedicated_tier_fallback = (
-            config_file is not None
-            and model_dim == 6144
-            and inter_dim in (384, 768)
-            and expert == 129
-            and topk == 5
-            and activation == ActivationType.Swiglu
-            and q_dtype_a == dtypes.fp8
-            and q_dtype_w == dtypes.fp4x2
-            and gate_mode == GateMode.INTERLEAVE
-        )
-        if result is None and allow_dedicated_tier_fallback:
-            matching_tiers = sorted(
-                {
-                    candidate[2]
-                    for candidate in primary
-                    if candidate[:2] == lookup_keys[:2]
-                    and candidate[3:] == lookup_keys[3:]
-                    and candidate[2] < token
-                },
-                reverse=True,
-            )
-            if matching_tiers:
-                fallback_tier_used = matching_tiers[0]
-                keys_fb = (
-                    lookup_keys[:2] + (fallback_tier_used,) + lookup_keys[3:]
-                )
-                result = primary[keys_fb]
-        # Generic MoE tables retain their existing fixed-tier fallback policy.
-        elif result is None and token > _PADDED_M_TIERS[0]:
+        if result is None and config_file is None and token > _PADDED_M_TIERS[0]:
             tier_idx = _PADDED_M_TIERS.index(token)
             for fallback_tier in reversed(_PADDED_M_TIERS[:tier_idx]):
                 keys_fb = lookup_keys[:2] + (fallback_tier,) + lookup_keys[3:]
@@ -3167,13 +3134,6 @@ def get_2stage_cfgs(
                     result = fallback.get(keys_fb_disabled, None)
                 if result is not None:
                     break
-        if fallback_tier_used is not None and config_file is not None:
-            logger.warning(
-                "[fused_moe] no exact dedicated FHMoE config for token tier "
-                "%d; reusing the untuned token-%d configuration",
-                token,
-                fallback_tier_used,
-            )
         return result
 
     cfg = _lookup_cfg(active_cfg_2stages)
